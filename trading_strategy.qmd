@@ -1,0 +1,525 @@
+---
+title: "FIN 452 — Quantitative Trading Strategy"
+subtitle: "Regime-Based Sector Rotation via Clustering & Kalman Filter"
+author: "Bao Nguyen"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    fig-width: 12
+    fig-height: 8
+execute:
+  warning: false
+  message: false
+  echo: true
+  cache: false
+---
+
+```{r setup}
+library(tidyverse)
+library(tidyquant)
+library(tidymodels)
+library(tidyclust)
+library(timetk)
+library(TTR)
+library(PerformanceAnalytics)
+library(xts)
+library(zoo)
+library(quantmod)
+library(RTL)
+library(lattice)
+library(plotly)
+library(foreach)
+library(doParallel)
+library(dlm)
+library(cluster)
+library(factoextra)
+
+# Helper: rolling function with partial window support
+# Computes as soon as min_obs are available; doesn't wait for full window.
+# Allows first-month ETF data to produce values without the full lookback.
+roll_partial <- function(x, width, FUN, min_obs = 5, ...) {
+  rollapply(x, width = width, FUN = function(z) {
+    z_clean <- z[!is.na(z)]
+    if (length(z_clean) < min_obs) return(NA_real_)
+    FUN(z_clean, ...)
+  }, fill = NA, align = "right", partial = TRUE)
+}
+
+# Helper: rolling beta (two-series covariance / variance)
+roll_beta <- function(sector_ret, spy_ret, width = 252, min_obs = 20) {
+  mat <- cbind(sector_ret, spy_ret)
+  rollapply(mat, width = width, FUN = function(x) {
+    cc <- complete.cases(x)
+    if (sum(cc) < min_obs) return(NA_real_)
+    cov(x[cc, 1], x[cc, 2]) / var(x[cc, 2])
+  }, by.column = FALSE, fill = NA, align = "right", partial = TRUE)
+}
+```
+
+## Universe & Periods
+
+```{r params}
+tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI",
+             "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY")
+
+# Availability constraints
+etf_inception <- tribble(
+  ~ticker, ~inception,
+  "SPY",   "1993-01-29",
+  "XLB",   "1998-12-22",
+  "XLC",   "2018-06-18",
+  "XLE",   "1998-12-22",
+  "XLF",   "1998-12-22",
+  "XLI",   "1998-12-22",
+  "XLK",   "1998-12-22",
+  "XLP",   "1998-12-22",
+  "XLRE",  "2015-10-07",
+  "XLU",   "1998-12-22",
+  "XLV",   "1998-12-22",
+  "XLY",   "1998-12-22"
+) %>% mutate(inception = as.Date(inception))
+
+TRAIN_START <- as.Date("2000-06-01")
+TRAIN_END   <- as.Date("2024-12-31")
+TEST_START  <- as.Date("2025-01-01")
+TEST_END    <- as.Date("2026-03-31")
+
+PULL_FROM   <- as.Date("1998-01-01")   # pull full history; filter later
+```
+
+## Data Loading
+
+```{r load-data}
+#| cache: true
+
+# ⚠️ COURSE PATTERN: tq_get → toTitleCase → xts → adjustOHLC → tibble
+load_etf <- function(ticker) {
+  tidyquant::tq_get(ticker, from = format(PULL_FROM)) %>%
+    dplyr::rename_all(tools::toTitleCase) %>%
+    timetk::tk_xts(date_var = Date) %>%
+    quantmod::adjustOHLC(use.Adjusted = TRUE) %>%
+    timetk::tk_tbl(rename_index = "Date") %>%
+    dplyr::select(-Adjusted) %>%
+    dplyr::mutate(across(where(is.numeric), round, 2)) %>%
+    dplyr::rename(date = Date) %>%
+    dplyr::mutate(ticker = ticker)
+}
+
+raw_data <- tickers %>%
+  purrr::map_dfr(load_etf) %>%
+  left_join(etf_inception, by = "ticker") %>%
+  filter(date >= inception) %>%        # drop pre-inception rows
+  select(-inception) %>%
+  arrange(ticker, date)
+
+# Training and test subsets
+train_data <- raw_data %>% filter(date >= TRAIN_START, date <= TRAIN_END)
+test_data  <- raw_data %>% filter(date >= TEST_START,  date <= TEST_END)
+
+glimpse(raw_data)
+```
+
+## Interest Rates
+
+10Y Treasury yield (`^TNX`) from Yahoo Finance, 2Y Treasury yield (`DGS2`) from FRED. The yield curve slope uses 10Y − 2Y — more responsive to rate cycle turning points than 10Y − 3M because the 2Y prices in Fed expectations before they act, which is what moves rate-sensitive sectors (XLF, XLRE, XLU).
+
+```{r load-rates}
+#| cache: true
+
+rates_raw <- bind_rows(
+  tq_get("^TNX", from = format(PULL_FROM)) %>%
+    transmute(date, series = "y10", value = close),
+  fredr::fredr("DGS2", observation_start = PULL_FROM) %>%
+    transmute(date, series = "y2", value)
+) %>%
+  pivot_wider(names_from = series, values_from = value)
+
+# Yield curve slope: 10Y minus 2Y (percentage points)
+# Positive = normal curve; negative = inverted (recession signal)
+rates <- rates_raw %>%
+  mutate(yield_curve = y10 - y2) %>%
+  filter(date >= TRAIN_START)
+```
+
+```{r chart-rates}
+rates_long <- rates %>%
+  pivot_longer(-date, names_to = "series", values_to = "value") %>%
+  mutate(series = recode(series,
+    y10 = "10Y Treasury", y2 = "2Y Treasury", yield_curve = "Yield Curve (10Y − 2Y)"))
+
+p_rates <- ggplot(rates_long, aes(x = date, y = value, colour = series)) +
+
+  annotate("rect", xmin = TEST_START,
+           xmax = max(rates_long$date, na.rm = TRUE),
+           ymin = -Inf, ymax = Inf, fill = "#f0f0f0", alpha = 0.8) +
+
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.4) +
+
+  geom_hline(yintercept = 0, linetype = "dotted",
+             colour = "grey50", linewidth = 0.3) +
+
+  geom_line(linewidth = 0.5, alpha = 0.85) +
+
+  scale_colour_manual(values = c(
+    "10Y Treasury"            = "#4e79a7",
+    "3M T-Bill"               = "#76b7b2",
+    "Yield Curve (10Y − 3M)"  = "#e15759"
+  )) +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::label_number(suffix = "%")) +
+
+  labs(
+    title    = "Treasury Yields & Yield Curve Slope",
+    subtitle = "Negative yield curve (red below zero) = inverted = recession signal",
+    x = NULL, y = "Yield (%)", colour = NULL
+  ) +
+
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggplotly(p_rates, tooltip = c("x", "y", "colour")) %>%
+  layout(legend = list(orientation = "h", y = 1.08))
+```
+
+## Historical Price Levels
+
+Each ETF indexed to 100 at its first available date within the chart window. Vertical line marks the train/test split. Greyed region = out-of-sample test period.
+
+```{r chart-levels}
+# Index each ETF to 100 at its first observation, then pivot wide (one column per ticker)
+display_data <- raw_data %>%
+  filter(date >= TRAIN_START) %>%
+  group_by(ticker) %>%
+  arrange(date) %>%
+  mutate(level = 100 * Close / first(Close)) %>%
+  ungroup() %>%
+  select(date, ticker, level) %>%
+  pivot_wider(names_from = ticker, values_from = level)
+
+# Pivot back to long for plotting
+p <- display_data %>%
+  pivot_longer(-date, names_to = "ticker", values_to = "level") %>%
+  mutate(ticker = factor(ticker, levels = tickers)) %>%
+  ggplot(aes(x = date, y = level)) +
+
+  # Test period shading
+  annotate("rect",
+           xmin = TEST_START, xmax = TEST_END,
+           ymin = -Inf, ymax = Inf,
+           fill = "#f0f0f0", alpha = 0.8) +
+
+  # Train/test split line
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.4) +
+
+  geom_line(colour = "steelblue", linewidth = 0.4) +
+
+  facet_wrap(~ ticker, scales = "free_y", ncol = 3) +
+
+  annotate("text",
+           x = TEST_START + 30, y = -Inf,
+           label = "Test", hjust = 0, vjust = -0.5,
+           size = 2.5, colour = "grey40") +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::label_number(suffix = "")) +
+
+  labs(
+    title    = "SPDR Sector ETF Historical Levels (Indexed to 100 at Training Start)",
+    subtitle = "Training: Jun 2000 – Dec 2024  |  Test: Jan 2025 – Mar 2026  |  * = later inception date",
+    x        = NULL,
+    y        = "Indexed Level (100 = first observation)"
+  ) +
+
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 7.5, face = "bold"),
+    axis.text.x      = element_text(size = 7, angle = 30, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+ggplotly(p, tooltip = c("x", "y")) %>%
+  layout(showlegend = FALSE)
+```
+
+## Rolling Volatility
+
+### Compute
+
+```{r compute-features}
+#| cache: true
+
+# Pull VIX — already annualised % (e.g. 20 = 20% annual vol), no transformation needed
+vix_raw <- tidyquant::tq_get("^VIX", from = format(PULL_FROM)) %>%
+  select(date, vix = close)
+
+# Get SPY returns separately for beta computation
+spy_returns <- raw_data %>%
+  filter(ticker == "SPY", date >= TRAIN_START) %>%
+  arrange(date) %>%
+  mutate(spy_retClCl = Close / lag(Close) - 1,
+         spy_log_ret = log(Close / lag(Close))) %>%
+  select(date, spy_retClCl, spy_log_ret)
+
+# 21 trading days = 30 calendar days * 252/365 ≈ 21
+# This matches VIX's 30-calendar-day horizon for apples-to-apples VRP
+RVOL_WINDOW  <- 21
+BETA_WINDOW  <- 252
+ZSCORE_WINDOW <- 252
+
+# Compute all rolling features per ETF
+# partial = TRUE via roll_partial() allows first-month data to produce values
+features_long <- raw_data %>%
+  filter(date >= TRAIN_START) %>%
+  group_by(ticker) %>%
+  arrange(date) %>%
+  mutate(
+    retClCl     = Close / lag(Close) - 1,
+    log_ret     = log(Close / lag(Close)),
+
+    # 21d rolling vol (annualised %)
+    rvol_21     = roll_partial(retClCl, width = RVOL_WINDOW, FUN = sd,
+                               min_obs = 5) * sqrt(252) * 100,
+
+    # 21d rolling log return (sum of daily log returns)
+    # Partial window: first-month ETFs get whatever days are available
+    log_ret_21  = roll_partial(log_ret, width = RVOL_WINDOW, FUN = sum,
+                               min_obs = 1)
+  ) %>%
+  ungroup() %>%
+  # Join SPY returns for beta computation
+  left_join(spy_returns, by = "date") %>%
+  # Join VIX for spread and VRP
+  left_join(vix_raw, by = "date") %>%
+  group_by(ticker) %>%
+  arrange(date) %>%
+  mutate(
+    # 252d rolling beta to SPY (partial: starts computing at 20 obs)
+    beta_252 = roll_beta(retClCl, spy_retClCl, width = BETA_WINDOW, min_obs = 20),
+
+    # Vol spread: sector realised vol minus VIX
+    # Levels are biased by sector character — z-score removes this
+    spread   = rvol_21 - vix,
+
+    # 252d rolling z-score of the spread
+    # Removes sector-specific mean AND variance → directly comparable across sectors
+    spread_z = {
+      sp_mean <- roll_partial(spread, width = ZSCORE_WINDOW, FUN = mean, min_obs = 30)
+      sp_sd   <- roll_partial(spread, width = ZSCORE_WINDOW, FUN = sd,   min_obs = 30)
+      (spread - sp_mean) / sp_sd
+    }
+  ) %>%
+  ungroup() %>%
+  select(date, ticker, retClCl, log_ret, rvol_21, log_ret_21,
+         beta_252, vix, spread, spread_z)
+
+# Wide format: one row per date, metrics as columns per ticker
+features_wide <- features_long %>%
+  select(date, ticker, rvol_21, spread, spread_z, log_ret_21, beta_252) %>%
+  pivot_wider(names_from = ticker,
+              values_from = c(rvol_21, spread, spread_z, log_ret_21, beta_252),
+              names_glue = "{ticker}_{.value}") %>%
+  left_join(vix_raw, by = "date") %>%
+  left_join(rates %>% select(date, yield_curve, y10, y2), by = "date") %>%
+  mutate(vrp = vix - SPY_rvol_21)   # VRP: apples-to-apples, both 21 trading days
+```
+
+### SPY Rolling Vol vs VIX
+
+21-trading-day realised vol for SPY plotted against VIX. Both cover ~30 calendar days (21 trading days = 30 * 252/365) — directly comparable. The gap is the Volatility Risk Premium (VRP): positive = fear premium; negative = crash worse than anticipated.
+
+```{r chart-spy-vol}
+spy_vol <- features_wide %>%
+  select(date, `21d Realised` = SPY_rvol_21, VIX = vix, VRP = vrp) %>%
+  pivot_longer(-date, names_to = "series", values_to = "vol") %>%
+  mutate(series = factor(series, levels = c("VIX", "21d Realised", "VRP")))
+
+p_spy <- ggplot(spy_vol, aes(x = date, y = vol, colour = series)) +
+
+  annotate("rect",
+           xmin = TEST_START, xmax = max(spy_vol$date, na.rm = TRUE),
+           ymin = -Inf, ymax = Inf, fill = "#f0f0f0", alpha = 0.8) +
+
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.4) +
+
+  geom_hline(yintercept = 0, linetype = "dotted",
+             colour = "grey60", linewidth = 0.3) +
+
+  geom_line(linewidth = 0.5, alpha = 0.85) +
+
+  scale_colour_manual(values = c(
+    "VIX"          = "#e15759",
+    "21d Realised" = "#4e79a7",
+    "VRP"          = "#f28e2b"
+  )) +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::label_number(suffix = "%")) +
+
+  labs(
+    title    = "SPY: VIX vs 21d Realised Volatility & VRP",
+    subtitle = "VRP = VIX − 21d Realised Vol (21 trading days ≈ 30 calendar days)  |  Positive = fear premium",
+    x        = NULL, y = "Annualised Volatility (%)", colour = NULL
+  ) +
+
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "top",
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+ggplotly(p_spy, tooltip = c("x", "y", "colour")) %>%
+  layout(legend = list(orientation = "h", y = 1.08))
+```
+
+### Sector ETF Vol Spread Z-Score
+
+Rolling z-score of each sector's vol spread (sector rvol − VIX), normalised by that sector's own 252-day rolling mean and standard deviation. Removes structural level differences — a z-score of +2 means the same anomalous stress regardless of whether the sector is normally above or below VIX. Partial window support: values appear earlier than 252 days but require at least 30 observations for the z-score.
+
+```{r chart-sector-vol}
+sector_tickers <- setdiff(tickers, "SPY")
+
+sector_vol <- features_long %>%
+  filter(ticker %in% sector_tickers) %>%
+  mutate(ticker = factor(ticker, levels = sector_tickers))
+
+p_sec <- ggplot(sector_vol, aes(x = date, y = spread_z)) +
+
+  annotate("rect",
+           xmin = TEST_START, xmax = max(sector_vol$date, na.rm = TRUE),
+           ymin = -Inf, ymax = Inf, fill = "#f0f0f0", alpha = 0.8) +
+
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.3) +
+
+  # Zero line = sector's historical norm
+  geom_hline(yintercept = 0, linetype = "dotted",
+             colour = "grey50", linewidth = 0.3) +
+
+  geom_line(colour = "#4e79a7", linewidth = 0.35, alpha = 0.85) +
+
+  facet_wrap(~ ticker, scales = "free_y", ncol = 3) +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+
+  labs(
+    title    = "Sector Vol Spread Z-Score  (sector rvol − VIX, normalised)",
+    subtitle = "Zero = historical norm  |  +2 = 2sd more stressed vs VIX than usual  |  Comparable across sectors",
+    x        = NULL, y = "Z-Score (standard deviations)"
+  ) +
+
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 8, face = "bold"),
+    axis.text.x      = element_text(size = 7, angle = 30, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+ggplotly(p_sec, tooltip = c("x", "y")) %>%
+  layout(showlegend = FALSE)
+```
+
+## Rolling Beta to SPY
+
+252-day rolling beta per sector vs SPY. Measures each sector's market sensitivity over time — a regime signal. When beta changes, the sector is coupling to or decoupling from the broad market. Partial window: starts producing values at 20 observations.
+
+```{r chart-beta}
+beta_data <- features_long %>%
+  filter(ticker %in% sector_tickers) %>%
+  mutate(ticker = factor(ticker, levels = sector_tickers))
+
+p_beta <- ggplot(beta_data, aes(x = date, y = beta_252)) +
+
+  annotate("rect",
+           xmin = TEST_START, xmax = max(beta_data$date, na.rm = TRUE),
+           ymin = -Inf, ymax = Inf, fill = "#f0f0f0", alpha = 0.8) +
+
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.3) +
+
+  geom_hline(yintercept = 1, linetype = "dotted",
+             colour = "grey50", linewidth = 0.3) +
+
+  geom_line(colour = "#59a14f", linewidth = 0.35, alpha = 0.85) +
+
+  facet_wrap(~ ticker, scales = "free_y", ncol = 3) +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+
+  labs(
+    title    = "252d Rolling Beta to SPY",
+    subtitle = "Beta = 1 line shown  |  Above 1 = amplifies SPY moves  |  Below 1 = dampens / decouples",
+    x        = NULL, y = "Beta"
+  ) +
+
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 8, face = "bold"),
+    axis.text.x      = element_text(size = 7, angle = 30, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+ggplotly(p_beta, tooltip = c("x", "y")) %>%
+  layout(showlegend = FALSE)
+```
+
+## 21d Rolling Log Return
+
+Cumulative log return over 21 trading days (~1 month). Captures short-term sector momentum. Partial window: first-month ETFs produce values from whatever days are available.
+
+```{r chart-logret}
+logret_data <- features_long %>%
+  filter(ticker %in% sector_tickers) %>%
+  mutate(ticker = factor(ticker, levels = sector_tickers))
+
+p_logret <- ggplot(logret_data, aes(x = date, y = log_ret_21)) +
+
+  annotate("rect",
+           xmin = TEST_START, xmax = max(logret_data$date, na.rm = TRUE),
+           ymin = -Inf, ymax = Inf, fill = "#f0f0f0", alpha = 0.8) +
+
+  geom_vline(xintercept = TEST_START, linetype = "dashed",
+             colour = "grey40", linewidth = 0.3) +
+
+  geom_hline(yintercept = 0, linetype = "dotted",
+             colour = "grey50", linewidth = 0.3) +
+
+  geom_line(colour = "#b07aa1", linewidth = 0.35, alpha = 0.85) +
+
+  facet_wrap(~ ticker, scales = "free_y", ncol = 3) +
+
+  scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::label_percent()) +
+
+  labs(
+    title    = "21d Rolling Log Return (Sector Momentum)",
+    subtitle = "Cumulative log return over 21 trading days  |  Positive = upward momentum  |  Negative = downward",
+    x        = NULL, y = "Log Return"
+  ) +
+
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text       = element_text(size = 8, face = "bold"),
+    axis.text.x      = element_text(size = 7, angle = 30, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+
+ggplotly(p_logret, tooltip = c("x", "y")) %>%
+  layout(showlegend = FALSE)
+```
