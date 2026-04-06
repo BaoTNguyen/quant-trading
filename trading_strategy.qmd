@@ -23,6 +23,7 @@ execute:
 
 ```{r setup}
 library(tidyverse)
+library(lubridate)
 library(tidyquant)
 library(tidymodels)
 library(tidyclust)
@@ -40,6 +41,8 @@ library(doParallel)
 library(dlm)
 library(cluster)
 library(factoextra)
+library(patchwork)
+library(ggrepel)
 
 # Helper: rolling function with partial window support
 # Computes as soon as min_obs are available; doesn't wait for full window.
@@ -50,6 +53,24 @@ roll_partial <- function(x, width, FUN, min_obs = 5, ...) {
     if (length(z_clean) < min_obs) return(NA_real_)
     FUN(z_clean, ...)
   }, fill = NA, align = "right", partial = TRUE)
+}
+
+# Helper: Kalman filter for a single indicator series (local level model)
+# Fits MLE observation noise (V) and process noise (W), then applies causal
+# dlmFilter (forward-pass only — no lookahead). NAs treated as missing
+# observations; filter propagates prior without updating.
+kf_level <- function(x, min_obs = 30) {
+  out <- rep(NA_real_, length(x))
+  if (sum(!is.na(x)) < min_obs) return(out)
+  fit <- tryCatch(
+    dlmMLE(x, parm = c(0, 0),
+           build = function(p) dlmModPoly(1, dV = exp(p[1]), dW = exp(p[2]))),
+    error = function(e) NULL
+  )
+  if (is.null(fit) || fit$convergence != 0) return(out)
+  mod  <- dlmModPoly(1, dV = exp(fit$par[1]), dW = exp(fit$par[2]))
+  filt <- dlmFilter(x, mod)
+  drop(filt$m[-1])   # m is (n+1): first row is prior m_0, drop it
 }
 
 # Helper: rolling beta (two-series covariance / variance)
@@ -101,19 +122,29 @@ PULL_FROM   <- as.Date("1998-01-01")   # pull full history; filter later
 
 # ⚠️ COURSE PATTERN: tq_get → toTitleCase → xts → adjustOHLC → tibble
 load_etf <- function(ticker) {
-  tidyquant::tq_get(ticker, from = format(PULL_FROM)) %>%
+  raw <- tryCatch(
+    tidyquant::tq_get(ticker, from = format(PULL_FROM)),
+    error = function(e) NULL
+  )
+  if (is.null(raw) || isFALSE(raw) || nrow(raw) == 0) {
+    warning(paste("tq_get failed for:", ticker))
+    return(NULL)
+  }
+  raw %>%
     dplyr::rename_all(tools::toTitleCase) %>%
     timetk::tk_xts(date_var = Date) %>%
     quantmod::adjustOHLC(use.Adjusted = TRUE) %>%
     timetk::tk_tbl(rename_index = "Date") %>%
     dplyr::select(-Adjusted) %>%
-    dplyr::mutate(across(where(is.numeric), round, 2)) %>%
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 2))) %>%
     dplyr::rename(date = Date) %>%
     dplyr::mutate(ticker = ticker)
 }
 
 raw_data <- tickers %>%
-  purrr::map_dfr(load_etf) %>%
+  purrr::map(load_etf) %>%
+  purrr::compact() %>%          # drop any NULL returns from failed downloads
+  dplyr::bind_rows() %>%
   left_join(etf_inception, by = "ticker") %>%
   filter(date >= inception) %>%        # drop pre-inception rows
   select(-inception) %>%
@@ -128,7 +159,9 @@ glimpse(raw_data)
 
 ## Interest Rates
 
-10Y Treasury yield (`^TNX`) from Yahoo Finance, 2Y Treasury yield (`DGS2`) from FRED. The yield curve slope uses 10Y − 2Y — more responsive to rate cycle turning points than 10Y − 3M because the 2Y prices in Fed expectations before they act, which is what moves rate-sensitive sectors (XLF, XLRE, XLU).
+All rate data pulled via `tq_get()` — no API key required. 10Y yield (`^TNX`) and 3M T-bill (`^IRX`) from Yahoo Finance; 2Y yield (`DGS2`) and 10Y breakeven inflation (`T10YIE`) from FRED via `get = "economic.data"` (public HTTP, no authentication). Yield curve slope = 10Y − 2Y. Breakeven inflation captures the inflation regime dimension — orthogonal to the yield curve slope and VIX.
+
+3M T-bill rate (`^IRX`) is pulled separately as the daily risk-free rate for Sharpe ratio calculation in `tradeStats()`. It is **not** used as a clustering feature.
 
 ```{r load-rates}
 #| cache: true
@@ -136,23 +169,34 @@ glimpse(raw_data)
 rates_raw <- bind_rows(
   tq_get("^TNX", from = format(PULL_FROM)) %>%
     transmute(date, series = "y10", value = close),
-  fredr::fredr("DGS2", observation_start = PULL_FROM) %>%
-    transmute(date, series = "y2", value)
+  tq_get("DGS2", get = "economic.data", from = format(PULL_FROM)) %>%
+    transmute(date, series = "y2", value = price),
+  tq_get("T10YIE", get = "economic.data", from = format(PULL_FROM)) %>%
+    transmute(date, series = "breakeven", value = price)
 ) %>%
   pivot_wider(names_from = series, values_from = value)
 
 # Yield curve slope: 10Y minus 2Y (percentage points)
 # Positive = normal curve; negative = inverted (recession signal)
+# Breakeven inflation: market-implied 10Y avg inflation (orthogonal regime dimension)
 rates <- rates_raw %>%
   mutate(yield_curve = y10 - y2) %>%
   filter(date >= TRAIN_START)
+
+# Risk-free rate (3M T-bill) for Sharpe calculation — NOT a clustering feature
+# Annualised % → daily decimal (divide by 100 for %, then by 252 for daily)
+rf_daily <- tq_get("^IRX", from = format(TRAIN_START)) %>%
+  transmute(date, rf_daily = close / 100 / 252)
 ```
 
 ```{r chart-rates}
 rates_long <- rates %>%
   pivot_longer(-date, names_to = "series", values_to = "value") %>%
   mutate(series = recode(series,
-    y10 = "10Y Treasury", y2 = "2Y Treasury", yield_curve = "Yield Curve (10Y − 2Y)"))
+    y10        = "10Y Treasury",
+    y2         = "2Y Treasury",
+    yield_curve = "Yield Curve (10Y − 2Y)",
+    breakeven  = "Breakeven Inflation (T10YIE)"))
 
 p_rates <- ggplot(rates_long, aes(x = date, y = value, colour = series)) +
 
@@ -169,18 +213,19 @@ p_rates <- ggplot(rates_long, aes(x = date, y = value, colour = series)) +
   geom_line(linewidth = 0.5, alpha = 0.85) +
 
   scale_colour_manual(values = c(
-    "10Y Treasury"            = "#4e79a7",
-    "3M T-Bill"               = "#76b7b2",
-    "Yield Curve (10Y − 3M)"  = "#e15759"
+    "10Y Treasury"                  = "#4e79a7",
+    "2Y Treasury"                   = "#76b7b2",
+    "Yield Curve (10Y − 2Y)"        = "#e15759",
+    "Breakeven Inflation (T10YIE)"  = "#f28e2b"
   )) +
 
   scale_x_date(date_breaks = "4 years", date_labels = "%Y") +
   scale_y_continuous(labels = scales::label_number(suffix = "%")) +
 
   labs(
-    title    = "Treasury Yields & Yield Curve Slope",
-    subtitle = "Negative yield curve (red below zero) = inverted = recession signal",
-    x = NULL, y = "Yield (%)", colour = NULL
+    title    = "Treasury Yields, Yield Curve & Breakeven Inflation",
+    subtitle = "Inverted curve (red below zero) = recession signal | Orange = inflation regime",
+    x = NULL, y = "Rate (%)", colour = NULL
   ) +
 
   theme_minimal(base_size = 11) +
@@ -324,15 +369,54 @@ features_long <- raw_data %>%
   select(date, ticker, retClCl, log_ret, rvol_21, log_ret_21,
          beta_252, vix, spread, spread_z)
 
+# Relative features: sector vs SPY benchmark
+# SPY row exists in features_long — pull it as reference series
+spy_ref <- features_long %>%
+  filter(ticker == "SPY") %>%
+  select(date, spy_rvol_21 = rvol_21, spy_log_ret_21 = log_ret_21)
+
+features_long <- features_long %>%
+  left_join(spy_ref, by = "date") %>%
+  mutate(
+    # Excess vol: how much more/less volatile than SPY (not VIX)
+    rel_vol      = rvol_21 - spy_rvol_21,
+    # Excess momentum: sector return minus market return — isolates alpha
+    rel_momentum = log_ret_21 - spy_log_ret_21
+  ) %>%
+  select(-spy_rvol_21, -spy_log_ret_21)
+
 # Wide format: one row per date, metrics as columns per ticker
 features_wide <- features_long %>%
-  select(date, ticker, rvol_21, spread, spread_z, log_ret_21, beta_252) %>%
+  select(date, ticker, rvol_21, spread, spread_z, log_ret_21, beta_252,
+         rel_vol, rel_momentum) %>%
   pivot_wider(names_from = ticker,
-              values_from = c(rvol_21, spread, spread_z, log_ret_21, beta_252),
+              values_from = c(rvol_21, spread, spread_z, log_ret_21, beta_252,
+                              rel_vol, rel_momentum),
               names_glue = "{ticker}_{.value}") %>%
   left_join(vix_raw, by = "date") %>%
-  left_join(rates %>% select(date, yield_curve, y10, y2), by = "date") %>%
+  left_join(rates %>% select(date, yield_curve, y10, y2, breakeven), by = "date") %>%
   mutate(vrp = vix - SPY_rvol_21)   # VRP: apples-to-apples, both 21 trading days
+```
+
+## Kalman Filter
+
+Each clustering input is smoothed independently with a local level model (random walk + noise). MLE estimates observation noise V and process noise W per series. Uses `dlmFilter()` only — causal forward pass, no lookahead.
+
+Columns smoothed: `vix`, `vrp`, `yield_curve`, `breakeven`, and all per-sector `_spread_z`, `_beta_252`, `_log_ret_21`, `_rel_vol`, `_rel_momentum` columns. Raw OHLCV-derived columns (`rvol_21`, `spread`, rate levels) are retained but not filtered — they are not clustering inputs.
+
+```{r kalman-filter}
+# Identify columns to filter (clustering inputs only)
+kf_cols <- c(
+  "vix", "vrp", "yield_curve", "breakeven",
+  grep("_spread_z$|_beta_252$|_log_ret_21$|_rel_vol$|_rel_momentum$",
+       names(features_wide), value = TRUE)
+)
+
+# Apply kf_level independently to each clustering column
+# All other columns (dates, raw vols, rate levels) pass through unchanged
+features_kf <- features_wide %>%
+  arrange(date) %>%
+  mutate(across(all_of(kf_cols), kf_level))
 ```
 
 ### SPY Rolling Vol vs VIX
@@ -522,4 +606,967 @@ p_logret <- ggplot(logret_data, aes(x = date, y = log_ret_21)) +
 
 ggplotly(p_logret, tooltip = c("x", "y")) %>%
   layout(showlegend = FALSE)
+```
+
+---
+
+# Clustering
+
+## Feature Matrix Preparation
+
+Clustering inputs are the Kalman-filtered macro features (`vix`, `vrp`, `yield_curve`, `breakeven`) plus per-sector `_spread_z`, `_beta_252`, and `_log_ret_21` for the 11 sector ETFs (SPY excluded — its beta to itself = 1, its spread_z ≈ −VRP). Rows with any NA are dropped; SPY-derived macro features already cover SPY's contribution.
+
+```{r cluster-prep}
+# Clustering features: macro + per-sector (sectors only, not SPY)
+cluster_cols <- c(
+  "vix", "vrp", "yield_curve", "breakeven",
+  paste0(sector_tickers, "_spread_z"),
+  paste0(sector_tickers, "_beta_252"),
+  paste0(sector_tickers, "_log_ret_21"),
+  paste0(sector_tickers, "_rel_vol"),
+  paste0(sector_tickers, "_rel_momentum")
+)
+
+# Training-period rows only; drop any date with incomplete features
+cluster_input <- features_kf %>%
+  filter(date >= TRAIN_START, date <= TRAIN_END) %>%
+  select(date, all_of(cluster_cols)) %>%
+  drop_na()
+
+# Scaled matrix for distance-based methods (hierarchical needs this too)
+cluster_recipe <- recipe(~ ., data = cluster_input %>% select(-date)) %>%
+  step_normalize(all_predictors())
+
+cluster_prep   <- prep(cluster_recipe)
+cluster_mat    <- bake(cluster_prep, new_data = NULL) %>% as.matrix()
+```
+
+## K Selection Diagnostics
+
+Elbow plot (total within-cluster sum of squares) and average silhouette width for K = 2–6. The elbow shows where additional clusters stop reducing compactness meaningfully; silhouette peaks at the K with best-separated clusters. Set `K_CLUSTERS` in the next chunk accordingly.
+
+```{r cluster-k-select}
+set.seed(42)
+
+# --- K-means: WSS and silhouette for K = 2:6 ---
+k_metrics <- map_dfr(2:6, function(k) {
+  km  <- kmeans(cluster_mat, centers = k, nstart = 25, iter.max = 200)
+  sil <- cluster::silhouette(km$cluster, dist(cluster_mat))
+  tibble(k = k, wss = km$tot.withinss, silhouette = mean(sil[, 3]))
+})
+
+p_elbow <- ggplot(k_metrics, aes(x = k, y = wss)) +
+  geom_line(colour = "#4e79a7", linewidth = 0.8) +
+  geom_point(colour = "#4e79a7", size = 3) +
+  scale_x_continuous(breaks = 2:6) +
+  labs(title = "K-Means Elbow Plot", x = "Number of Clusters (K)",
+       y = "Total Within-Cluster SS") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_sil <- ggplot(k_metrics, aes(x = k, y = silhouette)) +
+  geom_line(colour = "#e15759", linewidth = 0.8) +
+  geom_point(colour = "#e15759", size = 3) +
+  geom_vline(xintercept = k_metrics$k[which.max(k_metrics$silhouette)],
+             linetype = "dashed", colour = "grey50") +
+  scale_x_continuous(breaks = 2:6) +
+  labs(title = "Average Silhouette Width", x = "Number of Clusters (K)",
+       y = "Mean Silhouette") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_elbow + p_sil
+```
+
+## Cluster Fit
+
+`K_CLUSTERS` is set from the K selection diagnostics above — change it here to propagate everywhere.
+
+```{r cluster-fit}
+K_CLUSTERS <- 4   # <-- adjust after inspecting elbow/silhouette
+
+set.seed(42)
+
+km_spec <- k_means(num_clusters = K_CLUSTERS) %>% set_engine("stats")
+
+km_wf  <- workflow() %>%
+  add_recipe(cluster_recipe) %>%
+  add_model(km_spec)
+
+km_fit <- fit(km_wf, data = cluster_input %>% select(-date))
+
+cluster_assignments <- augment(km_fit, new_data = cluster_input) %>%
+  rename(km_cluster = .pred_cluster) %>%
+  mutate(km_cluster = as.integer(str_remove(km_cluster, "Cluster_")))
+```
+
+## PCA Biplot
+
+PCA reduces the 37-feature space to 2 dimensions. Points are coloured by cluster assignment. Well-separated blobs = stable, distinct regimes.
+
+```{r cluster-pca}
+pca_res  <- prcomp(cluster_mat, center = FALSE, scale. = FALSE)  # already normalised
+pca_vals <- as_tibble(pca_res$x[, 1:2]) %>%
+  bind_cols(cluster_assignments %>% select(date, km_cluster)) %>%
+  mutate(km_cluster = as.factor(km_cluster))
+
+pct_var <- round(summary(pca_res)$importance[2, 1:2] * 100, 1)
+
+p_pca <- ggplot(pca_vals, aes(x = PC1, y = PC2, colour = km_cluster)) +
+  geom_point(alpha = 0.4, size = 1.0) +
+  scale_colour_manual(values = c("#4e79a7","#e15759","#59a14f","#f28e2b",
+                                  "#b07aa1","#76b7b2")[seq_len(K_CLUSTERS)]) +
+  labs(
+    title    = "K-Means Clusters — PCA Biplot",
+    subtitle = paste0("PC1 ", pct_var[1], "% | PC2 ", pct_var[2], "% of variance"),
+    x = paste0("PC1 (", pct_var[1], "%)"),
+    y = paste0("PC2 (", pct_var[2], "%)"),
+    colour = "Cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggplotly(p_pca, tooltip = c("x", "y", "colour"))
+```
+
+## Cluster Profiles
+
+Mean feature values per K-means cluster. Standardised (z-score) so all features are on the same scale — positive = above average, negative = below. This is the economic regime interpretation step.
+
+```{r cluster-profiles}
+profile_data <- cluster_mat %>%
+  as_tibble() %>%
+  mutate(km_cluster = factor(cluster_assignments$km_cluster)) %>%
+  pivot_longer(-km_cluster, names_to = "feature", values_to = "value") %>%
+  group_by(km_cluster, feature) %>%
+  summarise(mean_z = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Heatmap: features × clusters
+p_profile <- ggplot(profile_data, aes(x = km_cluster, y = feature, fill = mean_z)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(mean_z, 2)), size = 2.5) +
+  scale_fill_gradient2(low = "#4e79a7", mid = "white", high = "#e15759",
+                       midpoint = 0, name = "Mean Z") +
+  labs(
+    title    = "Cluster Profiles — Mean Standardised Feature Values",
+    subtitle = "Red = above average  |  Blue = below average  |  Interpret economically before labelling",
+    x = "K-Means Cluster", y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+p_profile
+```
+
+---
+
+# Signal Generation
+
+## Parameters
+
+```{r signal-params}
+N_LONG           <- 3   # sectors to go long each month
+N_SHORT          <- 0   # sectors to go short (0 = long-only)
+MIN_CLUSTER_OBS  <- 6   # minimum cluster members before signal fires; else flat
+VIX_THRESHOLD    <- 25  # go fully flat when raw VIX exceeds this level
+DD_STOP          <- -0.20  # go flat next month if month-end drawdown exceeds this
+```
+
+## Expanding Window Signal Loop
+
+At each month-end rebalancing date, K-means is refit on all data up to that date. The current date's cluster is identified, sector average returns within that cluster are ranked, and signals are generated. Cluster labels are not carried across refits — only the economic content (centroid values) matters.
+
+```{r signal-generation}
+
+# Sector daily returns for ranking within clusters
+sector_ret <- features_long %>%
+  filter(ticker %in% sector_tickers) %>%
+  select(date, ticker, retClCl)
+
+# Month-end rebalancing dates within training window
+rebal_dates <- cluster_input %>%
+  mutate(ym = lubridate::floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  arrange(date) %>%
+  pull(date)
+
+# Expanding window loop — refit K-means at each rebalancing date
+signals_raw <- map_dfr(seq_along(rebal_dates), function(i) {
+  t   <- rebal_dates[i]
+  idx <- which(cluster_input$date == t)
+  if (length(idx) == 0 || idx < K_CLUSTERS * 3) return(NULL)
+
+  window_mat <- cluster_mat[1:idx, , drop = FALSE]
+
+  set.seed(42 + i)   # reproducible but distinct per refit
+  km <- kmeans(window_mat, centers = K_CLUSTERS, nstart = 25, iter.max = 200)
+
+  current_cluster <- km$cluster[idx]
+  cluster_dates   <- cluster_input$date[1:idx][km$cluster == current_cluster]
+
+  # Helper: return a fully flat tibble for this date
+  flat_signal <- function() {
+    tibble(rebal_date = t, cluster = current_cluster,
+           n_obs = length(cluster_dates),
+           ticker = sector_tickers, avg_ret = NA_real_, signal = 0L)
+  }
+
+  # Flat if cluster history too thin
+  if (length(cluster_dates) < MIN_CLUSTER_OBS) return(flat_signal())
+
+  # VIX regime filter — go fully flat when market fear is elevated
+  # Uses raw (non-KF) VIX so the filter reacts quickly to spikes
+  current_vix <- features_wide %>% filter(date == t) %>% pull(vix)
+  if (length(current_vix) == 1 && !is.na(current_vix) && current_vix > VIX_THRESHOLD) {
+    return(flat_signal())
+  }
+
+  # Rank sectors by avg retClCl within current cluster
+  rankings <- sector_ret %>%
+    filter(date %in% cluster_dates) %>%
+    group_by(ticker) %>%
+    summarise(avg_ret = mean(retClCl, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(avg_ret)) %>%
+    mutate(
+      rank   = row_number(),
+      n      = n(),
+      signal = case_when(
+        rank <= N_LONG & avg_ret > 0 ~ 1L,   # only long if cluster expects positive return
+        rank > n - N_SHORT           ~ -1L,
+        TRUE                         ~ 0L
+      )
+    )
+
+  rankings %>%
+    select(ticker, avg_ret, signal) %>%
+    mutate(rebal_date = t, cluster = current_cluster, n_obs = length(cluster_dates))
+})
+```
+
+## Cluster Assignment Over Time
+
+Which regime each month-end was assigned to. Colour = cluster label within that refit (labels shift arbitrarily across refits — interpret by centroid, not by number).
+
+```{r cluster-timeline}
+cluster_timeline <- signals_raw %>%
+  distinct(rebal_date, cluster, n_obs) %>%
+  mutate(cluster = factor(cluster))
+
+p_timeline <- ggplot(cluster_timeline,
+                     aes(x = rebal_date, y = cluster, colour = cluster)) +
+  geom_point(aes(size = n_obs), alpha = 0.7) +
+  geom_line(aes(group = 1), alpha = 0.2, colour = "grey50") +
+  scale_colour_manual(values = c("#4e79a7","#e15759","#59a14f","#f28e2b",
+                                  "#b07aa1","#76b7b2")[seq_len(K_CLUSTERS)]) +
+  scale_size_continuous(range = c(1, 5), name = "Cluster size") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title    = "Cluster Assignment at Each Month-End Rebalancing Date",
+    subtitle = "Point size = number of historical dates in that cluster  |  Labels shift across refits — read centroid heatmap",
+    x = NULL, y = "Cluster", colour = "Cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+
+ggplotly(p_timeline, tooltip = c("x", "y", "size"))
+```
+
+## Sector Signal Heatmap
+
+Signals generated at each month-end close for execution at next month open. Green = long (+1), red = short (−1), white = flat (0). This is what the strategy holds during each month.
+
+```{r signal-heatmap}
+signal_heatmap <- signals_raw %>%
+  mutate(ticker  = factor(ticker, levels = rev(sector_tickers)),
+         signal  = factor(signal, levels = c(-1L, 0L, 1L)))
+
+p_signals <- ggplot(signal_heatmap,
+                    aes(x = rebal_date, y = ticker, fill = signal)) +
+  geom_tile(colour = "white", linewidth = 0.2) +
+  scale_fill_manual(
+    values = c("-1" = "#e15759", "0" = "#f5f5f5", "1" = "#59a14f"),
+    labels = c("Short (−1)", "Flat (0)", "Long (+1)")
+  ) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title    = "Sector Signals Generated at Month-End Close",
+    subtitle = "Execute at open of following month  |  Green = long  |  Red = short  |  White = flat",
+    x = NULL, y = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 8),
+    panel.grid       = element_blank(),
+    legend.position  = "top"
+  )
+
+ggplotly(p_signals, tooltip = c("x", "y", "fill"))
+```
+
+## Most Recent Signal
+
+What the strategy signals for the most recent month in the training window — the last "read" before the test period.
+
+```{r signal-latest}
+signals_raw %>%
+  filter(rebal_date == max(rebal_date)) %>%
+  arrange(desc(avg_ret)) %>%
+  mutate(
+    signal_label = case_when(signal == 1L ~ "LONG", signal == -1L ~ "SHORT",
+                             TRUE ~ "flat"),
+    avg_ret_pct  = scales::percent(avg_ret, accuracy = 0.01)
+  ) %>%
+  select(rebal_date, ticker, avg_ret_pct, signal_label, n_obs) %>%
+  knitr::kable(
+    col.names = c("Rebal Date", "Sector", "Avg Cluster Return", "Signal", "Cluster Obs"),
+    caption   = "Most recent month-end signal — execute at next month open"
+  )
+```
+
+## End-of-Training Sector Snapshot
+
+Market dynamics as of the last training date. Each sector is positioned by its Kalman-filtered relative momentum (x) and vol stress z-score (y). Point size = 252d beta to SPY. Colour = signal generated for the following month.
+
+Quadrant interpretation:
+- **Top-right**: high momentum + high stress — strong move but stretched
+- **Bottom-right**: high momentum + low stress — clean uptrend, favourable
+- **Top-left**: negative momentum + high stress — distressed, avoid or short
+- **Bottom-left**: negative momentum + low stress — quiet underperformer
+
+```{r sector-snapshot}
+# Last available training date in features_kf
+last_train_date <- features_kf %>%
+  filter(date <= TRAIN_END) %>%
+  pull(date) %>% max()
+
+# Extract per-sector features at that date (pivot wide → long by sector)
+sector_snapshot <- features_kf %>%
+  filter(date == last_train_date) %>%
+  select(date,
+         matches("^(XL|SPY)[A-Z]*_rel_momentum$"),
+         matches("^(XL|SPY)[A-Z]*_spread_z$"),
+         matches("^(XL|SPY)[A-Z]*_beta_252$"),
+         matches("^(XL|SPY)[A-Z]*_rel_vol$")) %>%
+  pivot_longer(-date,
+               names_to  = c("ticker", "metric"),
+               names_pattern = "^(.+)_(rel_momentum|spread_z|beta_252|rel_vol)$") %>%
+  filter(ticker %in% sector_tickers) %>%
+  pivot_wider(names_from = metric, values_from = value)
+
+# Join last signal
+last_signal <- signals_raw %>%
+  filter(rebal_date == max(rebal_date)) %>%
+  select(ticker, signal, avg_ret)
+
+sector_snapshot <- sector_snapshot %>%
+  left_join(last_signal, by = "ticker") %>%
+  mutate(
+    signal_label = case_when(
+      signal == 1L  ~ "Long",
+      signal == -1L ~ "Short",
+      TRUE          ~ "Flat"
+    ),
+    signal_label = factor(signal_label, levels = c("Long", "Flat", "Short"))
+  )
+
+p_snapshot <- ggplot(sector_snapshot,
+                     aes(x = rel_momentum, y = spread_z,
+                         colour = signal_label, size = beta_252,
+                         label = ticker)) +
+  geom_hline(yintercept =  1, linetype = "dotted", colour = "grey70") +
+  geom_hline(yintercept = -1, linetype = "dotted", colour = "grey70") +
+  geom_hline(yintercept =  0, linetype = "dashed",  colour = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept =  0, linetype = "dashed",  colour = "grey50", linewidth = 0.4) +
+  geom_point(alpha = 0.85) +
+  ggrepel::geom_text_repel(size = 3.5, show.legend = FALSE,
+                            box.padding = 0.4, max.overlaps = 20) +
+  scale_colour_manual(values = c("Long" = "#59a14f", "Flat" = "#bab0ac",
+                                  "Short" = "#e15759")) +
+  scale_size_continuous(range = c(3, 10), name = "Beta (252d)") +
+  labs(
+    title    = paste0("Sector Market Dynamics — End of Training (",
+                      format(last_train_date, "%B %Y"), ")"),
+    subtitle = "X = relative momentum vs SPY  |  Y = vol stress z-score vs norm  |  Size = beta to SPY",
+    x        = "Relative Momentum (sector − SPY, 21d log return)",
+    y        = "Vol Stress Z-Score (sector rvol − VIX, 252d normalised)",
+    colour   = "Signal"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+ggplotly(p_snapshot, tooltip = c("label", "x", "y", "size", "colour"))
+```
+
+## Animated Snapshot — All Month-Ends
+
+Same chart as above but with a slider across every month-end rebalancing date in the training period. Use the play button or drag the slider to see how sector positions and signals evolved.
+
+```{r sector-snapshot-animated}
+# Raw (non-KF) features in long format — already has ticker column, no pivot needed
+# Raw values show month-to-month variation; KF values are too smooth to animate usefully
+snap_features <- features_long %>%
+  filter(ticker %in% sector_tickers,
+         date   %in% unique(signals_raw$rebal_date)) %>%
+  select(date, ticker, spread_z, beta_252, rel_momentum, rel_vol)
+
+# Join signals directly onto features — start from signals_raw to guarantee key alignment
+all_snapshots <- signals_raw %>%
+  select(rebal_date, ticker, signal) %>%
+  left_join(snap_features, by = c("rebal_date" = "date", "ticker")) %>%
+  mutate(
+    signal_label = case_when(
+      signal == 1L  ~ "Long",
+      signal == -1L ~ "Short",
+      TRUE          ~ "Flat"
+    ),
+    signal_label = factor(signal_label, levels = c("Long", "Flat", "Short")),
+    frame_label  = format(rebal_date, "%Y-%m")
+  ) %>%
+  drop_na(rel_momentum, spread_z, beta_252) %>%
+  mutate(bubble_size = scales::rescale(beta_252,
+                                       to   = c(10, 30),
+                                       from = c(0, max(abs(beta_252), na.rm = TRUE))))
+
+# Compute fixed axis limits so axes don't jump between frames
+x_range <- range(all_snapshots$rel_momentum, na.rm = TRUE) * 1.1
+y_range <- range(all_snapshots$spread_z,     na.rm = TRUE) * 1.1
+
+plot_ly(
+  all_snapshots,
+  x            = ~rel_momentum,
+  y            = ~spread_z,
+  size         = ~bubble_size,
+  color        = ~signal_label,
+  colors       = c("Long" = "#59a14f", "Flat" = "#bab0ac", "Short" = "#e15759"),
+  text         = ~ticker,
+  frame        = ~frame_label,
+  type         = "scatter",
+  mode         = "markers+text",
+  textposition = "top center",
+  marker       = list(sizemode = "diameter", sizeref = 1, opacity = 0.85)
+) %>%
+  animation_opts(frame = 600, transition = 300, redraw = FALSE) %>%
+  animation_slider(currentvalue = list(prefix = "Month-end: ", font = list(size = 12))) %>%
+  animation_button(x = 0, xanchor = "left", y = -0.12) %>%
+  layout(
+    title = list(text = "Sector Dynamics at Each Month-End Rebalancing Date",
+                 font = list(size = 14)),
+    xaxis = list(title = "Relative Momentum (sector − SPY, 21d)",
+                 range = x_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    yaxis = list(title = "Vol Stress Z-Score",
+                 range = y_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    legend = list(title = list(text = "Signal")),
+    showlegend = TRUE
+  )
+```
+
+## Animated Snapshot — Vol Stress vs Absolute Momentum
+
+Same animation using `spread_z` (y) and raw `log_ret_21` (x) — absolute sector return rather than excess over SPY. During bull markets all sectors shift right together; during bear markets all shift left. This shows whether a sector's momentum is positive in absolute terms, while spread_z shows whether its vol is elevated relative to its own history.
+
+```{r sector-snapshot-animated-2}
+snap2 <- signals_raw %>%
+  select(rebal_date, ticker, signal) %>%
+  left_join(
+    features_long %>%
+      filter(ticker %in% sector_tickers,
+             date   %in% unique(signals_raw$rebal_date)) %>%
+      select(date, ticker, log_ret_21, spread_z, beta_252),
+    by = c("rebal_date" = "date", "ticker")
+  ) %>%
+  mutate(
+    signal_label = case_when(
+      signal == 1L  ~ "Long",
+      signal == -1L ~ "Short",
+      TRUE          ~ "Flat"
+    ),
+    signal_label = factor(signal_label, levels = c("Long", "Flat", "Short")),
+    frame_label  = format(rebal_date, "%Y-%m")
+  ) %>%
+  drop_na(log_ret_21, spread_z, beta_252) %>%
+  mutate(bubble_size = scales::rescale(beta_252,
+                                       to   = c(10, 30),
+                                       from = c(0, max(abs(beta_252), na.rm = TRUE))))
+
+x2_range <- range(snap2$log_ret_21, na.rm = TRUE) * 1.1
+y2_range <- range(snap2$spread_z,   na.rm = TRUE) * 1.1
+
+plot_ly(
+  snap2,
+  x            = ~log_ret_21,
+  y            = ~spread_z,
+  size         = ~bubble_size,
+  color        = ~signal_label,
+  colors       = c("Long" = "#59a14f", "Flat" = "#bab0ac", "Short" = "#e15759"),
+  text         = ~ticker,
+  frame        = ~frame_label,
+  type         = "scatter",
+  mode         = "markers+text",
+  textposition = "top center",
+  marker       = list(sizemode = "diameter", sizeref = 1, opacity = 0.85)
+) %>%
+  animation_opts(frame = 600, transition = 300, redraw = FALSE) %>%
+  animation_slider(currentvalue = list(prefix = "Month-end: ", font = list(size = 12))) %>%
+  animation_button(x = 0, xanchor = "left", y = -0.12) %>%
+  layout(
+    title = list(text = "Vol Stress Z-Score vs 21d Log Return",
+                 font = list(size = 14)),
+    xaxis = list(title = "21d Log Return (absolute)",
+                 range = x2_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    yaxis = list(title = "Vol Stress Z-Score",
+                 range = y2_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    legend = list(title = list(text = "Signal")),
+    showlegend = TRUE
+  )
+```
+
+---
+
+# Training Period Performance
+
+## P&L Calculation
+
+Daily P&L chain for the training window. Signals are generated at each month-end close and executed at the open of the following trading day. Positions are held until the next rebalancing. Portfolio weight = 1/N_LONG per long sector; N_SHORT = 0 (long-only). Total allocation is always 100% when at least one long is active.
+
+Transaction costs of **5 bps per side** (buy or sell) are applied only to positions that actually change at each rebalancing — sectors that are held across months pay no cost. Close-to-close daily returns are used throughout.
+
+```{r training-pnl}
+# -- Step 1: Map each rebal_date to its execution date (next available trading day) --
+spy_dates <- raw_data %>%
+  filter(ticker == "SPY", date >= TRAIN_START, date <= TRAIN_END) %>%
+  arrange(date) %>%
+  pull(date)
+
+exec_map <- tibble(rebal_date = rebal_dates) %>%
+  rowwise() %>%
+  mutate(exec_date = {
+    candidates <- spy_dates[spy_dates > rebal_date]
+    if (length(candidates) == 0) NA_Date_ else candidates[1]
+  }) %>%
+  ungroup() %>%
+  filter(!is.na(exec_date))
+
+# -- Step 2: Build daily position series per sector --
+# Start from exec_date each month, forward-fill until next exec_date
+daily_signals <- signals_raw %>%
+  select(rebal_date, ticker, signal) %>%
+  inner_join(exec_map, by = "rebal_date") %>%
+  select(date = exec_date, ticker, signal)
+
+all_combos <- expand_grid(date = spy_dates, ticker = sector_tickers)
+
+daily_pos <- all_combos %>%
+  left_join(daily_signals, by = c("date", "ticker")) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  fill(signal, .direction = "down") %>%
+  mutate(signal = replace_na(signal, 0L)) %>%   # flat before first signal fires
+  ungroup()
+
+# -- Step 3: Daily close-to-close returns per sector --
+daily_rets <- raw_data %>%
+  filter(ticker %in% sector_tickers, date %in% spy_dates) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(ret_cc = Close / dplyr::lag(Close) - 1) %>%
+  ungroup() %>%
+  select(date, ticker, ret_cc)
+
+TC_BPS <- 0.0005   # 5 bps per side (buy or sell)
+
+# Helper: compute daily portfolio weights from a position tibble
+compute_weights <- function(pos_tbl) {
+  pos_tbl %>%
+    group_by(date) %>%
+    mutate(
+      n_long  = sum(signal == 1L,  na.rm = TRUE),
+      n_short = sum(signal == -1L, na.rm = TRUE),
+      weight  = case_when(
+        signal ==  1L & n_long  > 0 ~  1 / n_long,
+        signal == -1L & n_short > 0 ~ -1 / n_short,
+        TRUE                        ~  0
+      )
+    ) %>%
+    ungroup()
+}
+
+# -- Step 4a: Transaction costs on portfolio weight turnover --
+# TC is proportional to how much weight actually moves, not signal integers.
+# e.g. entering 1 of 3 longs = weight change of 1/3 → TC = 1/3 × 5bps, not 1 × 5bps.
+# Self-financing is preserved: TC is funded from portfolio equity before compounding,
+# so the investment base for the next period is reduced by the cost paid.
+rebal_costs <- compute_weights(daily_pos) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(prev_weight = dplyr::lag(weight, default = 0)) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarise(
+    tc = sum(abs(weight - prev_weight), na.rm = TRUE) * TC_BPS,
+    .groups = "drop"
+  )
+
+# -- Step 4b: First-pass P&L (VIX filter + avg_ret > 0 filter applied via signals_raw) --
+daily_pnl <- compute_weights(daily_pos) %>%
+  left_join(daily_rets, by = c("date", "ticker")) %>%
+  group_by(date) %>%
+  summarise(
+    portfolio_ret_gross = sum(weight * replace_na(ret_cc, 0), na.rm = TRUE),
+    n_long              = first(n_long),
+    .groups             = "drop"
+  ) %>%
+  left_join(rebal_costs, by = "date") %>%
+  mutate(
+    tc            = replace_na(tc, 0),
+    portfolio_ret = portfolio_ret_gross - tc,
+    cumeq         = cumprod(1 + portfolio_ret),
+    cumeq_gross   = cumprod(1 + portfolio_ret_gross)
+  )
+
+# -- Step 4c: Portfolio drawdown stop (second pass) --
+# At each month-end, check the strategy's drawdown from its running peak.
+# If drawdown < DD_STOP, go fully flat for the entire following month.
+# This is causal: we observe drawdown at month-end before deciding next month's trades.
+month_end_dd <- daily_pnl %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  arrange(date) %>%
+  mutate(
+    peak    = cummax(cumeq),
+    dd      = (cumeq - peak) / peak,
+    in_stop = dd < DD_STOP,
+    # Lead by 1 month: drawdown observed this month → next month is flat
+    next_ym_stop = dplyr::lead(in_stop, default = FALSE)
+  ) %>%
+  mutate(ym = floor_date(date %m+% months(1), "month")) %>%   # next month key
+  select(ym, next_ym_stop)
+
+daily_pos_dd <- daily_pos %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  left_join(month_end_dd, by = "ym") %>%
+  mutate(
+    next_ym_stop = replace_na(next_ym_stop, FALSE),
+    signal       = if_else(next_ym_stop, 0L, signal)
+  ) %>%
+  select(-ym, -next_ym_stop)
+
+# Second-pass TC and P&L with DD stop applied
+rebal_costs_dd <- compute_weights(daily_pos_dd) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(prev_weight = dplyr::lag(weight, default = 0)) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarise(tc = sum(abs(weight - prev_weight), na.rm = TRUE) * TC_BPS, .groups = "drop")
+
+daily_pnl_dd <- compute_weights(daily_pos_dd) %>%
+  left_join(daily_rets, by = c("date", "ticker")) %>%
+  group_by(date) %>%
+  summarise(
+    portfolio_ret_gross = sum(weight * replace_na(ret_cc, 0), na.rm = TRUE),
+    n_long              = first(n_long),
+    .groups             = "drop"
+  ) %>%
+  left_join(rebal_costs_dd, by = "date") %>%
+  mutate(
+    tc            = replace_na(tc, 0),
+    portfolio_ret = portfolio_ret_gross - tc,
+    cumeq_dd      = cumprod(1 + portfolio_ret)
+  ) %>%
+  select(date, cumeq_dd)
+
+# -- Step 5: SPY buy-and-hold benchmark --
+spy_bh <- raw_data %>%
+  filter(ticker == "SPY", date %in% spy_dates) %>%
+  arrange(date) %>%
+  mutate(
+    ret_cc    = Close / dplyr::lag(Close) - 1,
+    cumeq_spy = cumprod(1 + replace_na(ret_cc, 0))
+  ) %>%
+  select(date, cumeq_spy, ret_cc_spy = ret_cc)
+
+training_perf <- daily_pnl %>%
+  left_join(spy_bh,      by = "date") %>%
+  left_join(daily_pnl_dd, by = "date")
+
+# Quick summary stats
+cat(sprintf(
+  "Strategy + DD stop: %.1f%%  |  Strategy (net TC): %.1f%%  |  Strategy (gross): %.1f%%  |  SPY B&H: %.1f%%\nTC drag: %.2f%%\n",
+  (last(training_perf$cumeq_dd)    - 1) * 100,
+  (last(training_perf$cumeq)       - 1) * 100,
+  (last(training_perf$cumeq_gross) - 1) * 100,
+  (last(training_perf$cumeq_spy)   - 1) * 100,
+  (last(training_perf$cumeq_gross) - last(training_perf$cumeq)) * 100
+))
+```
+
+## Cumulative Return vs SPY
+
+```{r chart-training-cumeq}
+# Rebalancing dates as vertical markers
+rebal_markers <- exec_map %>%
+  filter(exec_date %in% spy_dates) %>%
+  pull(exec_date)
+
+fig_cumeq <- plot_ly(training_perf, x = ~date) %>%
+  add_lines(
+    y    = ~cumeq_dd,
+    name = paste0("Strategy + DD stop (", scales::percent(abs(DD_STOP)), ")"),
+    line = list(color = "#59a14f", width = 2)
+  ) %>%
+  add_lines(
+    y    = ~cumeq,
+    name = "Strategy (net of TC)",
+    line = list(color = "#4e79a7", width = 2)
+  ) %>%
+  add_lines(
+    y    = ~cumeq_gross,
+    name = "Strategy (gross)",
+    line = list(color = "#4e79a7", width = 1.5, dash = "dot")
+  ) %>%
+  add_lines(
+    y    = ~cumeq_spy,
+    name = "SPY Buy & Hold",
+    line = list(color = "#e15759", width = 2, dash = "dash")
+  ) %>%
+  layout(
+    title = list(
+      text = "Training Period Cumulative Return — Strategy vs SPY Buy & Hold",
+      font = list(size = 14)
+    ),
+    xaxis = list(
+      title        = NULL,
+      rangeslider  = list(visible = FALSE),
+      type         = "date"
+    ),
+    yaxis = list(
+      title      = "Cumulative Return (1.0 = start)",
+      tickformat = ".2f"
+    ),
+    legend     = list(x = 0.01, y = 0.99, bgcolor = "rgba(255,255,255,0.7)"),
+    hovermode  = "x unified",
+    shapes     = list(
+      list(type = "line", x0 = TEST_START, x1 = TEST_START,
+           y0 = 0, y1 = 1, yref = "paper",
+           line = list(color = "grey50", width = 1, dash = "dot"))
+    ),
+    annotations = list(
+      list(x = TEST_START, y = 1, yref = "paper", xanchor = "left",
+           text = " Test start", showarrow = FALSE,
+           font = list(size = 10, color = "grey50"))
+    )
+  )
+
+fig_cumeq
+```
+
+## Monthly Return Distribution
+
+```{r chart-monthly-dist}
+# Aggregate to monthly returns for both strategy and SPY
+monthly_perf <- training_perf %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  summarise(
+    strat_monthly = prod(1 + portfolio_ret) - 1,
+    spy_monthly   = prod(1 + replace_na(ret_cc_spy, 0)) - 1,
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-ym, names_to = "series", values_to = "monthly_ret") %>%
+  mutate(series = recode(series,
+    strat_monthly = "Strategy",
+    spy_monthly   = "SPY Buy & Hold"
+  ))
+
+p_monthly_dist <- ggplot(monthly_perf,
+                         aes(x = monthly_ret, fill = series, colour = series)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.4,
+                 position = "identity") +
+  geom_density(linewidth = 0.8, alpha = 0) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values   = c("Strategy" = "#4e79a7", "SPY Buy & Hold" = "#e15759")) +
+  scale_colour_manual(values = c("Strategy" = "#4e79a7", "SPY Buy & Hold" = "#e15759")) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title    = "Monthly Return Distribution — Training Period",
+    subtitle = "Histogram + density overlay  |  Dashed line = 0%",
+    x        = "Monthly Return",
+    y        = "Density",
+    fill     = NULL, colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+
+ggplotly(p_monthly_dist, tooltip = c("x", "density"))
+```
+
+## Rolling Metrics
+
+```{r chart-drawdown}
+dd_data <- training_perf %>%
+  arrange(date) %>%
+  mutate(
+    peak_strat    = cummax(cumeq),
+    peak_spy      = cummax(cumeq_spy),
+    peak_dd       = cummax(replace_na(cumeq_dd, 1)),
+    dd_strat      = (cumeq     - peak_strat) / peak_strat,
+    dd_spy        = (cumeq_spy - peak_spy)   / peak_spy,
+    dd_strat_stop = (replace_na(cumeq_dd, 1) - peak_dd) / peak_dd
+  )
+
+# Max drawdown dates and values for annotations
+mdd_strat <- dd_data %>% slice_min(dd_strat, n = 1)
+mdd_spy   <- dd_data %>% slice_min(dd_spy,   n = 1)
+mdd_dd    <- dd_data %>% slice_min(dd_strat_stop, n = 1)
+
+plot_ly(dd_data, x = ~date) %>%
+  add_lines(y = ~dd_strat_stop,
+            name = paste0("Strategy + DD stop (", scales::percent(abs(DD_STOP)), ")"),
+            line = list(color = "#59a14f", width = 1.5)) %>%
+  add_lines(y = ~dd_strat,
+            name = "Strategy (net TC)",
+            line = list(color = "#4e79a7", width = 2)) %>%
+  add_lines(y = ~dd_spy,
+            name = "SPY Buy & Hold",
+            line = list(color = "#e15759", width = 2, dash = "dash")) %>%
+  add_markers(
+    data = mdd_strat,
+    x = ~date, y = ~dd_strat,
+    name = paste0("Strategy MDD: ", scales::percent(mdd_strat$dd_strat, accuracy = 0.1)),
+    marker = list(color = "#4e79a7", size = 10, symbol = "circle-open", line = list(width = 2)),
+    showlegend = TRUE
+  ) %>%
+  add_markers(
+    data = mdd_spy,
+    x = ~date, y = ~dd_spy,
+    name = paste0("SPY MDD: ", scales::percent(mdd_spy$dd_spy, accuracy = 0.1)),
+    marker = list(color = "#e15759", size = 10, symbol = "circle-open", line = list(width = 2)),
+    showlegend = TRUE
+  ) %>%
+  add_markers(
+    data = mdd_dd,
+    x = ~date, y = ~dd_strat_stop,
+    name = paste0("DD-stop MDD: ", scales::percent(mdd_dd$dd_strat_stop, accuracy = 0.1)),
+    marker = list(color = "#59a14f", size = 10, symbol = "circle-open", line = list(width = 2)),
+    showlegend = TRUE
+  ) %>%
+  add_segments(
+    x = ~TRAIN_START, xend = ~TRAIN_END,
+    y = DD_STOP, yend = DD_STOP,
+    line = list(color = "orange", width = 1, dash = "dot"),
+    name = paste0("DD stop threshold (", scales::percent(DD_STOP, accuracy = 1), ")"),
+    inherit = FALSE
+  ) %>%
+  layout(
+    title     = list(text = "Drawdown from Peak — Training Period", font = list(size = 14)),
+    xaxis     = list(title = NULL, type = "date"),
+    yaxis     = list(title = "Drawdown from Peak",
+                     tickformat = ".0%", zeroline = TRUE, zerolinecolor = "#ccc"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.01, bgcolor = "rgba(255,255,255,0.8)")
+  )
+```
+
+## Summary Statistics
+
+```{r training-stats}
+n_days   <- nrow(training_perf)
+n_years  <- n_days / 252
+
+strat_rets       <- training_perf$portfolio_ret
+strat_rets_gross <- training_perf$portfolio_ret_gross
+spy_rets   <- replace_na(training_perf$ret_cc_spy, 0)
+
+# Join rf_daily for Sharpe
+rf_joined <- training_perf %>%
+  left_join(rf_daily, by = "date") %>%
+  mutate(rf_daily = replace_na(rf_daily, 0))
+
+excess_strat <- strat_rets    - rf_joined$rf_daily
+excess_spy   <- spy_rets      - rf_joined$rf_daily
+
+sharpe_strat <- (mean(excess_strat, na.rm = TRUE) /
+                 sd(excess_strat,   na.rm = TRUE)) * sqrt(252)
+sharpe_spy   <- (mean(excess_spy,   na.rm = TRUE) /
+                 sd(excess_spy,     na.rm = TRUE)) * sqrt(252)
+
+total_strat        <- last(training_perf$cumeq)       - 1
+total_strat_gross  <- last(training_perf$cumeq_gross) - 1
+total_spy          <- last(training_perf$cumeq_spy)   - 1
+cagr_strat         <- (1 + total_strat)^(1/n_years)       - 1
+cagr_strat_gross   <- (1 + total_strat_gross)^(1/n_years) - 1
+cagr_spy           <- (1 + total_spy)^(1/n_years)         - 1
+ann_vol_strat      <- sd(strat_rets,       na.rm = TRUE) * sqrt(252)
+ann_vol_strat_gross<- sd(strat_rets_gross, na.rm = TRUE) * sqrt(252)
+ann_vol_spy        <- sd(spy_rets,         na.rm = TRUE) * sqrt(252)
+
+peak_strat        <- cummax(training_perf$cumeq)
+peak_strat_gross  <- cummax(training_perf$cumeq_gross)
+peak_spy          <- cummax(training_perf$cumeq_spy)
+peak_dd_stop      <- cummax(replace_na(training_perf$cumeq_dd, 1))
+max_dd_strat      <- min((training_perf$cumeq       - peak_strat)       / peak_strat,       na.rm = TRUE)
+max_dd_strat_gross<- min((training_perf$cumeq_gross - peak_strat_gross) / peak_strat_gross, na.rm = TRUE)
+max_dd_spy        <- min((training_perf$cumeq_spy   - peak_spy)         / peak_spy,         na.rm = TRUE)
+max_dd_dd_stop    <- min((replace_na(training_perf$cumeq_dd, 1) - peak_dd_stop) / peak_dd_stop, na.rm = TRUE)
+
+# Dates of max drawdown for each series
+mdd_date_strat   <- training_perf$date[which.min((training_perf$cumeq - peak_strat) / peak_strat)]
+mdd_date_spy     <- training_perf$date[which.min((training_perf$cumeq_spy - peak_spy) / peak_spy)]
+mdd_date_dd_stop <- training_perf$date[which.min((replace_na(training_perf$cumeq_dd, 1) - peak_dd_stop) / peak_dd_stop)]
+
+excess_strat_gross <- strat_rets_gross - rf_joined$rf_daily
+sharpe_strat_gross <- (mean(excess_strat_gross, na.rm = TRUE) /
+                       sd(excess_strat_gross,   na.rm = TRUE)) * sqrt(252)
+
+tibble(
+  Metric = c("Total Return", "CAGR", "Ann. Volatility", "Sharpe Ratio",
+             "Max Drawdown", "MDD Date", "TC Drag", "Period"),
+  `Strategy + DD Stop` = c(
+    scales::percent(last(training_perf$cumeq_dd, na.rm = TRUE) - 1, accuracy = 0.1),
+    scales::percent((last(training_perf$cumeq_dd, na.rm = TRUE))^(1/n_years) - 1, accuracy = 0.1),
+    "—",
+    "—",
+    scales::percent(max_dd_dd_stop, accuracy = 0.1),
+    format(mdd_date_dd_stop, "%Y-%m-%d"),
+    "—",
+    paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
+  ),
+  `Strategy (net TC)` = c(
+    scales::percent(total_strat,       accuracy = 0.1),
+    scales::percent(cagr_strat,        accuracy = 0.1),
+    scales::percent(ann_vol_strat,     accuracy = 0.1),
+    round(sharpe_strat, 3),
+    scales::percent(max_dd_strat,      accuracy = 0.1),
+    format(mdd_date_strat, "%Y-%m-%d"),
+    scales::percent(total_strat_gross - total_strat, accuracy = 0.1),
+    paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
+  ),
+  `Strategy (gross)` = c(
+    scales::percent(total_strat_gross,      accuracy = 0.1),
+    scales::percent(cagr_strat_gross,       accuracy = 0.1),
+    scales::percent(ann_vol_strat_gross,    accuracy = 0.1),
+    round(sharpe_strat_gross, 3),
+    scales::percent(max_dd_strat_gross,     accuracy = 0.1),
+    "—",
+    "—",
+    paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
+  ),
+  `SPY Buy & Hold` = c(
+    scales::percent(total_spy,    accuracy = 0.1),
+    scales::percent(cagr_spy,     accuracy = 0.1),
+    scales::percent(ann_vol_spy,  accuracy = 0.1),
+    round(sharpe_spy, 3),
+    scales::percent(max_dd_spy,   accuracy = 0.1),
+    format(mdd_date_spy, "%Y-%m-%d"),
+    "—",
+    paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
+  )
+) %>%
+  knitr::kable(caption = "Training Period Performance Summary (5 bps/side TC)", align = "lrrrr")
 ```

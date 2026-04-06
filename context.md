@@ -92,15 +92,15 @@ Last updated: 2026-04-05
 - [ ] Load indicator data via APIs (FRED, Yahoo)
 
 ### 4.2 Clustering (PRIMARY)
-- [ ] Select features/indicators for clustering input
-- [ ] Implement via `tidymodels` framework
+- [x] Select features/indicators for clustering input (37 features: 4 macro + 11×3 sector)
+- [x] Implement via `tidymodels` framework (tidyclust k_means workflow)
 - [ ] Clustering drives core trading signal logic
-- [ ] Document cluster interpretation (economic meaning)
+- [x] Document cluster interpretation (cluster-profiles heatmap; economic labelling step)
 
 ### 4.3 Kalman Filter (REQUIRED)
-- [ ] Implement on relevant indicators
+- [x] Implement on relevant indicators (`kf_level()` helper, local level model, MLE V/W)
 - [ ] Use in conjunction with clustering for trade signals
-- [ ] Document how it complements clustering
+- [x] Document how it complements clustering (smooths indicators before K-means; prevents spurious regime flips)
 
 ### 4.4 Mermaid Mental Model
 - [ ] Flowchart: data → indicators → clustering → Kalman → signal → trade
@@ -173,7 +173,7 @@ Last updated: 2026-04-05
 | `foreach` / `doParallel` | Multi-core optimization |
 | `dlm` | Kalman filter |
 | `cluster` / `factoextra` | Clustering algorithms & visualization |
-| `fredr` | FRED API data (T10YIE breakeven inflation; rates moved to Yahoo) |
+| `fredr` | ~~Not used~~ — replaced by `tq_get(..., get = "economic.data")` for FRED pulls |
 
 ## 7. Reference Code Patterns
 
@@ -374,7 +374,8 @@ See Part I §3.1 for the fixed asset universe.
 | SPY OHLCV | Yahoo Finance | `tidyquant::tq_get()` | Daily |
 | VIX (^VIX) | Yahoo Finance | `tidyquant::tq_get()` | Daily |
 | 10Y Treasury yield (^TNX) | Yahoo Finance | `tidyquant::tq_get()` | Daily |
-| 2Y Treasury yield (DGS2) | FRED | `fredr::fredr()` | Daily |
+| 2Y Treasury yield (DGS2) | FRED | `tq_get("DGS2", get = "economic.data")` — no API key | Daily |
+| 3M T-bill (^IRX) | Yahoo Finance | `tidyquant::tq_get()` | Daily — risk-free rate for Sharpe only, not a clustering feature |
 | Breakeven inflation (T10YIE) | FRED | `fredr` | Daily |
 
 **Data availability within training:**
@@ -397,12 +398,14 @@ Three-layer pipeline: Raw Data → Kalman-Filtered Indicators → Clustering →
 |---------|-------------|--------|-----------------|
 | Yield curve slope | 10Y − 3M (^TNX − ^IRX) | — | Monetary policy stance / recession signal (NY Fed preferred) |
 | VIX level | Raw VIX close | — | Market-wide implied fear (forward-looking) |
-| Breakeven inflation | T10YIE | — | Inflation expectations |
+| Breakeven inflation | T10YIE (FRED) | — | Inflation regime — orthogonal to yield curve slope and VIX |
 | 21d rolling vol per sector | `roll_partial(retClCl, 21, sd) * √252 * 100` | 21d | Sector-specific realized stress |
 | Vol spread z-score | `(sector_rvol_21 − VIX)` z-scored over 252d | 21d vol, 252d z-score | Regime-pure sector stress vs market fear |
 | VRP | VIX − SPY_rvol_21 | 21d | Fear premium; market over/under-pricing risk |
 | 252d rolling beta to SPY | `cov(sector, SPY) / var(SPY)` rolling 252d | 252d | Sector coupling/decoupling from market |
 | 21d rolling log return | `log(price_t / price_{t-21})` | 21d | Short-term momentum per sector |
+| Relative vol | `sector_rvol_21 − SPY_rvol_21` | 21d | Excess vol vs market benchmark (not vs VIX) |
+| Relative momentum | `sector_log_ret_21 − SPY_log_ret_21` | 21d | Excess return vs market — isolates sector alpha from broad market move |
 
 #### Layer 2: Kalman Filter (Option A — Filter Before Clustering)
 
@@ -589,7 +592,9 @@ flowchart TD
 | 2026-04-05 | 252d rolling beta to SPY as confirmed feature | Captures sector coupling/decoupling; structural sensitivity changes | Shorter windows (too noisy) |
 | 2026-04-05 | 21d rolling log return as confirmed feature | Momentum signal matching vol/VRP horizon | 60d/120d (may add later as optimization parameter) |
 | 2026-04-05 | Partial window support via `roll_partial()` | Allows feature computation from first month of ETF existence (min_obs=5) | Require full window (loses early data) |
-| 2026-04-05 | Yahoo Finance for interest rates (^TNX, ^IRX) | Avoids FRED API dependency; yield curve = 10Y−3M (NY Fed preferred recession indicator) | FRED DGS10−DGS2 |
+| 2026-04-06 | Yield curve = 10Y−2Y (^TNX + DGS2 FRED) | 2Y prices Fed expectations before they act; more responsive for sector rotation signals | 10Y−3M (lags Fed action) |
+| 2026-04-06 | ^IRX (3M T-bill) pulled separately as daily Rf for Sharpe | Yield curve slope (10Y−2Y) is a regime signal; Sharpe denominator needs short-term rate level separately | Use constant Rf |
+| 2026-04-06 | T10YIE (breakeven inflation) confirmed as clustering feature | Captures inflation regime dimension — orthogonal to yield curve slope and VIX; XLE/XLB outperform high breakeven; XLK/XLRE hurt | VIX alone as proxy |
 
 ---
 
@@ -662,6 +667,42 @@ best_combo = combn(candidates, n_long) with lowest mean pairwise correlation
 **Direction:** N-day change in VIX. Rising fear vs calming. Was in original feature set but may be redundant with VIX level + VRP.
 **Next step:** Compute correlation with VIX level; if |r| > 0.70, drop
 
+### Beta Deviation per Sector
+**Status:** Working memory — not yet implemented
+**Direction:** `sector_beta_252 − mean(all sector betas)` at each date. Captures whether a sector is becoming more/less market-coupled *relative to peers* — removes the market-wide beta drift.
+**Next step:** Implement if clustering silhouette improves; check redundancy with beta_252 level
+
+### Yield Curve × Beta Interaction
+**Status:** Working memory — not yet implemented
+**Direction:** `yield_curve × sector_beta_252`. Rate-sensitive sectors (XLRE, XLU) get penalised when curve inverts. Makes yield curve signal sector-specific rather than market-wide.
+**Next step:** Implement after evaluating current feature set silhouette
+
+### Breakeven × Relative Vol Interaction
+**Status:** Working memory — not yet implemented
+**Direction:** `breakeven × (sector_rvol_21 − SPY_rvol_21)`. Captures inflation stress landing specifically on commodity sectors (XLE, XLB).
+**Next step:** Implement if inflation regime separation is weak in cluster profiles
+
+### Breakeven Momentum
+**Status:** Working memory — not yet implemented
+**Direction:** 21d change in T10YIE. Direction of inflation expectation change matters more than level for rotation timing. Rising → into XLE/XLB, out of XLK/XLRE.
+**Next step:** Implement; check if it adds separation beyond raw breakeven level
+
+### Real Yield
+**Status:** Working memory — not yet implemented
+**Direction:** `y10 − breakeven` (nominal yield minus inflation expectations = real yield). Rising real yield crushes long-duration growth (XLK, XLC) and rate-sensitives (XLRE, XLU) more directly than nominal yield alone.
+**Next step:** Compute; check correlation with yield_curve to avoid redundancy
+
+### Momentum & Vol Dispersion (market-wide)
+**Status:** Working memory — not yet implemented
+**Direction:** `sd(all sector rel_momentum)` and `sd(all sector spread_z)` — one value per date capturing how dispersed sectors are. High dispersion = sectors diverging = regime change signal.
+**Next step:** Implement as standalone clustering features after core feature set is validated
+
+### Self-Financing & Position Sizing
+**Status:** Working memory — architecture decision pending
+**Direction:** Strategy is self-financing. When rotating, proceeds from exiting sectors fund entering sectors. Weight = `1/n_active_longs` per long, `1/n_active_shorts` per short. Total long exposure = 100%, short = 100%. Flat sectors receive no capital. Cash earns 0% (conservative).
+**Monthly rebalancing only:** No intra-month trades. "Daily trading frequency" = daily P&L calculation. `trade ≠ 0` only at month-end rebalancing dates.
+**Next step:** Implement in signal → trade → pos → P&L chain
+
 ## Open Architecture Questions
 
 - **Long-short vs long-only:** When n_short=0, un-allocated capital earns 0%. This affects Sharpe. Document explicitly.
@@ -680,3 +721,4 @@ best_combo = combn(candidates, n_long) with lowest mean pairwise correlation
 | Sector momentum dispersion | Replaced by vol dispersion (more stable for monthly clustering) | 2026-04-05 |
 | Cross-sector beta as clustering feature | Only useful for portfolio construction, not regime detection | 2026-04-05 |
 | Cross-sector correlation in levels | Structural level differences; use as summary stats only | 2026-04-05 |
+| Hierarchical clustering | O(n²) memory incompatible with expanding window (~289 refits); dendrogram unreadable at 6,200 rows | 2026-04-06 |
