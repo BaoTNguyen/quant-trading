@@ -1,6 +1,5 @@
 ---
-title: "FIN 452 — Quantitative Trading Strategy"
-subtitle: "Regime-Based Sector Rotation via Clustering & Kalman Filter"
+title: "Clustering for Regime-Based Sector Rotation"
 author: "Bao Nguyen"
 date: today
 format:
@@ -402,15 +401,11 @@ features_wide <- features_long %>%
 
 Each clustering input is smoothed independently with a local level model (random walk + noise). MLE estimates observation noise V and process noise W per series. Uses `dlmFilter()` only — causal forward pass, no lookahead.
 
-Columns smoothed: `vix`, `vrp`, `yield_curve`, `breakeven`, and all per-sector `_spread_z`, `_beta_252`, `_log_ret_21`, `_rel_vol`, `_rel_momentum` columns. Raw OHLCV-derived columns (`rvol_21`, `spread`, rate levels) are retained but not filtered — they are not clustering inputs.
+Columns smoothed: `vix`, `vrp`, `yield_curve`, `breakeven` — the four macro features used as Layer 1 (regime detection) clustering inputs. Per-sector features are left raw — they feed into Layer 2 (sector clustering within regime) where actual returns matter more than smoothed estimates.
 
 ```{r kalman-filter}
-# Identify columns to filter (clustering inputs only)
-kf_cols <- c(
-  "vix", "vrp", "yield_curve", "breakeven",
-  grep("_spread_z$|_beta_252$|_log_ret_21$|_rel_vol$|_rel_momentum$",
-       names(features_wide), value = TRUE)
-)
+# Only smooth macro features for Layer 1 regime clustering
+kf_cols <- c("vix", "vrp", "yield_curve", "breakeven")
 
 # Apply kf_level independently to each clustering column
 # All other columns (dates, raw vols, rate levels) pass through unchanged
@@ -617,28 +612,24 @@ ggplotly(p_logret, tooltip = c("x", "y")) %>%
 Clustering inputs are the Kalman-filtered macro features (`vix`, `vrp`, `yield_curve`, `breakeven`) plus per-sector `_spread_z`, `_beta_252`, and `_log_ret_21` for the 11 sector ETFs (SPY excluded — its beta to itself = 1, its spread_z ≈ −VRP). Rows with any NA are dropped; SPY-derived macro features already cover SPY's contribution.
 
 ```{r cluster-prep}
-# Clustering features: macro + per-sector (sectors only, not SPY)
-cluster_cols <- c(
-  "vix", "vrp", "yield_curve", "breakeven",
-  paste0(sector_tickers, "_spread_z"),
-  paste0(sector_tickers, "_beta_252"),
-  paste0(sector_tickers, "_log_ret_21"),
-  paste0(sector_tickers, "_rel_vol"),
-  paste0(sector_tickers, "_rel_momentum")
-)
+# Layer 1: Regime detection via time-period clustering on macro features only
+# Each row = one trading date; features are Kalman-filtered macro indicators
+cluster_cols <- c("vix", "vrp", "yield_curve", "breakeven")
 
-# Training-period rows only; drop any date with incomplete features
 cluster_input <- features_kf %>%
   filter(date >= TRAIN_START, date <= TRAIN_END) %>%
   select(date, all_of(cluster_cols)) %>%
   drop_na()
 
-# Scaled matrix for distance-based methods (hierarchical needs this too)
+# Normalise for distance-based clustering
 cluster_recipe <- recipe(~ ., data = cluster_input %>% select(-date)) %>%
   step_normalize(all_predictors())
 
-cluster_prep   <- prep(cluster_recipe)
-cluster_mat    <- bake(cluster_prep, new_data = NULL) %>% as.matrix()
+cluster_prep <- prep(cluster_recipe)
+cluster_mat  <- bake(cluster_prep, new_data = NULL) %>% as.matrix()
+
+cat(sprintf("Layer 1 input: %d dates × %d macro features\n",
+            nrow(cluster_mat), ncol(cluster_mat)))
 ```
 
 ## K Selection Diagnostics
@@ -646,32 +637,42 @@ cluster_mat    <- bake(cluster_prep, new_data = NULL) %>% as.matrix()
 Elbow plot (total within-cluster sum of squares) and average silhouette width for K = 2–6. The elbow shows where additional clusters stop reducing compactness meaningfully; silhouette peaks at the K with best-separated clusters. Set `K_CLUSTERS` in the next chunk accordingly.
 
 ```{r cluster-k-select}
+# K selection for Layer 1 regime detection (time-period clustering)
 set.seed(42)
 
-# --- K-means: WSS and silhouette for K = 2:6 ---
+sil_sample_idx <- sample(nrow(cluster_mat), min(500, nrow(cluster_mat)))
+sil_sample_mat <- cluster_mat[sil_sample_idx, ]
+
 k_metrics <- map_dfr(2:6, function(k) {
-  km  <- kmeans(cluster_mat, centers = k, nstart = 25, iter.max = 200)
-  sil <- cluster::silhouette(km$cluster, dist(cluster_mat))
-  tibble(k = k, wss = km$tot.withinss, silhouette = mean(sil[, 3]))
+  km_full   <- kmeans(cluster_mat, centers = k, nstart = 25, iter.max = 200)
+  km_sample <- kmeans(sil_sample_mat, centers = km_full$centers, nstart = 1, iter.max = 50)
+  sil       <- cluster::silhouette(km_sample$cluster, dist(sil_sample_mat))
+  tibble(k = k, wss = km_full$tot.withinss, silhouette = mean(sil[, 3]))
 })
+
+best_k_sil <- k_metrics$k[which.max(k_metrics$silhouette)]
+cat(sprintf("Layer 1 silhouette-optimal K = %d  (silhouette = %.3f)\n",
+            best_k_sil, max(k_metrics$silhouette)))
 
 p_elbow <- ggplot(k_metrics, aes(x = k, y = wss)) +
   geom_line(colour = "#4e79a7", linewidth = 0.8) +
   geom_point(colour = "#4e79a7", size = 3) +
   scale_x_continuous(breaks = 2:6) +
-  labs(title = "K-Means Elbow Plot", x = "Number of Clusters (K)",
-       y = "Total Within-Cluster SS") +
+  labs(title = "Layer 1 Elbow Plot (Regime Detection)",
+       subtitle = "Time-period clustering on macro features",
+       x = "Number of Clusters (K)", y = "Total Within-Cluster SS") +
   theme_minimal(base_size = 11) +
   theme(plot.title = element_text(face = "bold"))
 
 p_sil <- ggplot(k_metrics, aes(x = k, y = silhouette)) +
   geom_line(colour = "#e15759", linewidth = 0.8) +
   geom_point(colour = "#e15759", size = 3) +
-  geom_vline(xintercept = k_metrics$k[which.max(k_metrics$silhouette)],
-             linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = best_k_sil, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = best_k_sil + 0.15, y = min(k_metrics$silhouette),
+           label = paste0("K = ", best_k_sil), hjust = 0, size = 3.5, colour = "grey40") +
   scale_x_continuous(breaks = 2:6) +
-  labs(title = "Average Silhouette Width", x = "Number of Clusters (K)",
-       y = "Mean Silhouette") +
+  labs(title = "Layer 1 Average Silhouette Width",
+       x = "Number of Clusters (K)", y = "Mean Silhouette") +
   theme_minimal(base_size = 11) +
   theme(plot.title = element_text(face = "bold"))
 
@@ -683,29 +684,25 @@ p_elbow + p_sil
 `K_CLUSTERS` is set from the K selection diagnostics above — change it here to propagate everywhere.
 
 ```{r cluster-fit}
-K_CLUSTERS <- 4   # <-- adjust after inspecting elbow/silhouette
+K_CLUSTERS <- 3   # Layer 1 regime clusters — confirmed by silhouette
+K_SECTORS  <- 2   # Layer 2 sector clusters within each regime
 
 set.seed(42)
+km_fit_full <- kmeans(cluster_mat, centers = K_CLUSTERS, nstart = 25, iter.max = 200)
 
-km_spec <- k_means(num_clusters = K_CLUSTERS) %>% set_engine("stats")
+cluster_assignments <- cluster_input %>%
+  mutate(km_cluster = km_fit_full$cluster)
 
-km_wf  <- workflow() %>%
-  add_recipe(cluster_recipe) %>%
-  add_model(km_spec)
-
-km_fit <- fit(km_wf, data = cluster_input %>% select(-date))
-
-cluster_assignments <- augment(km_fit, new_data = cluster_input) %>%
-  rename(km_cluster = .pred_cluster) %>%
-  mutate(km_cluster = as.integer(str_remove(km_cluster, "Cluster_")))
+cat(sprintf("Layer 1: K=%d regimes | Layer 2: K=%d sector groups per regime\n",
+            K_CLUSTERS, K_SECTORS))
 ```
 
 ## PCA Biplot
 
-PCA reduces the 37-feature space to 2 dimensions. Points are coloured by cluster assignment. Well-separated blobs = stable, distinct regimes.
+PCA reduces the 4 macro features to 2 dimensions. Points are trading dates coloured by Layer 1 regime cluster. Well-separated blobs = stable, distinct regimes.
 
 ```{r cluster-pca}
-pca_res  <- prcomp(cluster_mat, center = FALSE, scale. = FALSE)  # already normalised
+pca_res  <- prcomp(cluster_mat, center = FALSE, scale. = FALSE)
 pca_vals <- as_tibble(pca_res$x[, 1:2]) %>%
   bind_cols(cluster_assignments %>% select(date, km_cluster)) %>%
   mutate(km_cluster = as.factor(km_cluster))
@@ -717,11 +714,11 @@ p_pca <- ggplot(pca_vals, aes(x = PC1, y = PC2, colour = km_cluster)) +
   scale_colour_manual(values = c("#4e79a7","#e15759","#59a14f","#f28e2b",
                                   "#b07aa1","#76b7b2")[seq_len(K_CLUSTERS)]) +
   labs(
-    title    = "K-Means Clusters — PCA Biplot",
+    title    = "Layer 1 Regime Clusters — PCA Biplot",
     subtitle = paste0("PC1 ", pct_var[1], "% | PC2 ", pct_var[2], "% of variance"),
     x = paste0("PC1 (", pct_var[1], "%)"),
     y = paste0("PC2 (", pct_var[2], "%)"),
-    colour = "Cluster"
+    colour = "Regime"
   ) +
   theme_minimal(base_size = 11) +
   theme(plot.title = element_text(face = "bold"))
@@ -729,9 +726,9 @@ p_pca <- ggplot(pca_vals, aes(x = PC1, y = PC2, colour = km_cluster)) +
 ggplotly(p_pca, tooltip = c("x", "y", "colour"))
 ```
 
-## Cluster Profiles
+## Regime Profiles
 
-Mean feature values per K-means cluster. Standardised (z-score) so all features are on the same scale — positive = above average, negative = below. This is the economic regime interpretation step.
+Mean macro feature values per regime cluster. Standardised (z-score) so all features are on the same scale. Interpret economically: high VIX + inverted yield curve = stress regime.
 
 ```{r cluster-profiles}
 profile_data <- cluster_mat %>%
@@ -741,20 +738,19 @@ profile_data <- cluster_mat %>%
   group_by(km_cluster, feature) %>%
   summarise(mean_z = mean(value, na.rm = TRUE), .groups = "drop")
 
-# Heatmap: features × clusters
 p_profile <- ggplot(profile_data, aes(x = km_cluster, y = feature, fill = mean_z)) +
   geom_tile(colour = "white", linewidth = 0.3) +
-  geom_text(aes(label = round(mean_z, 2)), size = 2.5) +
+  geom_text(aes(label = round(mean_z, 2)), size = 3) +
   scale_fill_gradient2(low = "#4e79a7", mid = "white", high = "#e15759",
                        midpoint = 0, name = "Mean Z") +
   labs(
-    title    = "Cluster Profiles — Mean Standardised Feature Values",
-    subtitle = "Red = above average  |  Blue = below average  |  Interpret economically before labelling",
-    x = "K-Means Cluster", y = NULL
+    title    = "Layer 1 Regime Profiles — Mean Macro Feature Values",
+    subtitle = "Red = above average  |  Blue = below average",
+    x = "Regime Cluster", y = NULL
   ) +
-  theme_minimal(base_size = 10) +
+  theme_minimal(base_size = 11) +
   theme(plot.title  = element_text(face = "bold"),
-        axis.text.y = element_text(size = 7))
+        axis.text.y = element_text(size = 9))
 
 p_profile
 ```
@@ -766,112 +762,183 @@ p_profile
 ## Parameters
 
 ```{r signal-params}
-N_LONG           <- 3   # sectors to go long each month
-N_SHORT          <- 0   # sectors to go short (0 = long-only)
-MIN_CLUSTER_OBS  <- 6   # minimum cluster members before signal fires; else flat
-VIX_THRESHOLD    <- 25  # go fully flat when raw VIX exceeds this level
-DD_STOP          <- -0.20  # go flat next month if month-end drawdown exceeds this
+N_LONG        <- 3      # max sectors to go long from the best cluster each month
+N_SHORT       <- 0      # sectors to short (0 = long-only)
+VIX_THRESHOLD <- 25     # go fully flat when VIX exceeds this level
+DD_STOP       <- -0.20  # go flat next month if month-end drawdown exceeds this
+DD_PARTIAL    <- -0.10  # between DD_PARTIAL and DD_STOP: 50% exposure
+VIX_REENTRY   <- 20     # re-enter at 50% if VIX drops below this while in DD stop
+MAX_REGIME_DAYS <- 120  # Layer 2 uses only the most recent ~6 months of regime history
 ```
 
-## Expanding Window Signal Loop
+## Two-Layer Signal Loop
 
-At each month-end rebalancing date, K-means is refit on all data up to that date. The current date's cluster is identified, sector average returns within that cluster are ranked, and signals are generated. Cluster labels are not carried across refits — only the economic content (centroid values) matters.
+**Layer 1 — Regime detection:** Expanding-window K-means on Kalman-filtered macro features (VIX, VRP, yield curve, breakeven). Identifies the current market regime and retrieves all historical dates in the same regime.
+
+**Layer 2 — Sector clustering within regime:** For historical dates in the current regime, computes per-sector return, volatility, and Sharpe ratio. K-means clusters the 11 sectors into K_SECTORS groups. The cluster with the highest regime-conditional return is selected; top N_LONG sectors by current 21d momentum are signalled long.
 
 ```{r signal-generation}
 
-# Sector daily returns for ranking within clusters
+# Sector daily returns + 21d compound momentum
 sector_ret <- features_long %>%
   filter(ticker %in% sector_tickers) %>%
-  select(date, ticker, retClCl)
+  select(date, ticker, retClCl) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(momentum_60 = slider::slide_dbl(retClCl, ~prod(1 + .x, na.rm = TRUE) - 1,
+                                         .before = 20, .complete = TRUE)) %>%
+  ungroup()
 
 # Month-end rebalancing dates within training window
 rebal_dates <- cluster_input %>%
-  mutate(ym = lubridate::floor_date(date, "month")) %>%
+  mutate(ym = floor_date(date, "month")) %>%
   group_by(ym) %>%
   slice_max(date, n = 1) %>%
   ungroup() %>%
   arrange(date) %>%
   pull(date)
 
-# Expanding window loop — refit K-means at each rebalancing date
-signals_raw <- map_dfr(seq_along(rebal_dates), function(i) {
-  t   <- rebal_dates[i]
-  idx <- which(cluster_input$date == t)
-  if (length(idx) == 0 || idx < K_CLUSTERS * 3) return(NULL)
+# Two-layer signal function
+two_layer_signal <- function(t, i, N_LONG, N_SHORT, VIX_THRESHOLD,
+                              cluster_input_df, cluster_mat_full,
+                              seed_offset = 0L, min_regime_obs = 20L) {
 
-  window_mat <- cluster_mat[1:idx, , drop = FALSE]
+  flat <- tibble(rebal_date = t, regime = NA_integer_, sector_cluster = NA_integer_,
+                 n_regime_dates = 0L, ticker = sector_tickers,
+                 avg_ret = NA_real_, signal = 0L)
 
-  set.seed(42 + i)   # reproducible but distinct per refit
-  km <- kmeans(window_mat, centers = K_CLUSTERS, nstart = 25, iter.max = 200)
-
-  current_cluster <- km$cluster[idx]
-  cluster_dates   <- cluster_input$date[1:idx][km$cluster == current_cluster]
-
-  # Helper: return a fully flat tibble for this date
-  flat_signal <- function() {
-    tibble(rebal_date = t, cluster = current_cluster,
-           n_obs = length(cluster_dates),
-           ticker = sector_tickers, avg_ret = NA_real_, signal = 0L)
-  }
-
-  # Flat if cluster history too thin
-  if (length(cluster_dates) < MIN_CLUSTER_OBS) return(flat_signal())
-
-  # VIX regime filter — go fully flat when market fear is elevated
-  # Uses raw (non-KF) VIX so the filter reacts quickly to spikes
+  # VIX filter
   current_vix <- features_wide %>% filter(date == t) %>% pull(vix)
-  if (length(current_vix) == 1 && !is.na(current_vix) && current_vix > VIX_THRESHOLD) {
-    return(flat_signal())
-  }
+  if (length(current_vix) == 1 && !is.na(current_vix) && current_vix > VIX_THRESHOLD)
+    return(flat)
 
-  # Rank sectors by avg retClCl within current cluster
-  rankings <- sector_ret %>%
-    filter(date %in% cluster_dates) %>%
+  # --- Layer 1: Regime detection ---
+  idx <- which(cluster_input_df$date == t)
+  if (length(idx) == 0 || idx < K_CLUSTERS * 3) return(flat)
+
+  window_mat <- cluster_mat_full[1:idx, , drop = FALSE]
+  set.seed(42 + i + seed_offset)
+  km_regime <- kmeans(window_mat, centers = K_CLUSTERS, nstart = 25, iter.max = 200)
+
+  current_regime <- km_regime$cluster[idx]
+  regime_dates   <- cluster_input_df$date[1:idx][km_regime$cluster == current_regime]
+
+  if (length(regime_dates) < min_regime_obs) return(flat)
+
+  # --- Layer 2: Sector clustering within regime ---
+  # Cap to most recent regime dates for responsiveness
+  regime_dates <- tail(regime_dates, MAX_REGIME_DAYS)
+
+  # Compute per-sector performance over recent regime dates
+  regime_sector_stats <- sector_ret %>%
+    filter(date %in% regime_dates, ticker %in% sector_tickers) %>%
     group_by(ticker) %>%
-    summarise(avg_ret = mean(retClCl, na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(avg_ret)) %>%
-    mutate(
-      rank   = row_number(),
-      n      = n(),
-      signal = case_when(
-        rank <= N_LONG & avg_ret > 0 ~ 1L,   # only long if cluster expects positive return
-        rank > n - N_SHORT           ~ -1L,
-        TRUE                         ~ 0L
-      )
-    )
+    summarise(
+      regime_ret    = mean(retClCl, na.rm = TRUE),
+      regime_vol    = sd(retClCl, na.rm = TRUE),
+      regime_sharpe = if_else(regime_vol > 0, regime_ret / regime_vol, 0),
+      .groups = "drop"
+    ) %>%
+    drop_na()
 
-  rankings %>%
-    select(ticker, avg_ret, signal) %>%
-    mutate(rebal_date = t, cluster = current_cluster, n_obs = length(cluster_dates))
+  if (nrow(regime_sector_stats) < K_SECTORS + 1) return(flat)
+
+  feat_sector <- regime_sector_stats %>%
+    select(regime_ret, regime_vol, regime_sharpe) %>%
+    scale()
+
+  set.seed(100 + i + seed_offset)
+  km_sector <- kmeans(feat_sector, centers = K_SECTORS, nstart = 25, iter.max = 200)
+
+  regime_sector_stats$sector_cluster <- km_sector$cluster
+
+  # Best sector cluster = highest average regime return
+  best_cl <- regime_sector_stats %>%
+    group_by(sector_cluster) %>%
+    summarise(avg = mean(regime_ret, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(avg, n = 1, with_ties = FALSE) %>%
+    pull(sector_cluster)
+
+  # Current 21d momentum for ranking within best cluster; N_LONG is a cap
+  mom_now <- sector_ret %>%
+    filter(date == t) %>%
+    select(ticker, momentum_60)
+
+  best_sectors <- regime_sector_stats %>%
+    filter(sector_cluster == best_cl) %>%
+    left_join(mom_now, by = "ticker") %>%
+    arrange(desc(momentum_60)) %>%
+    mutate(rank = row_number(),
+           signal = if_else(rank <= N_LONG, 1L, 0L))
+
+  # Full sector list with cluster assignments
+  all_sectors <- regime_sector_stats %>%
+    select(ticker, sector_cluster, avg_ret = regime_ret) %>%
+    left_join(best_sectors %>% select(ticker, signal), by = "ticker") %>%
+    mutate(signal = replace_na(signal, 0L)) %>%
+    {bind_rows(., tibble(
+        ticker = setdiff(sector_tickers, .$ticker),
+        sector_cluster = NA_integer_, avg_ret = NA_real_, signal = 0L))} %>%
+    mutate(rebal_date = t, regime = current_regime,
+           n_regime_dates = length(regime_dates))
+
+  all_sectors
+}
+
+signals_raw <- map_dfr(seq_along(rebal_dates), function(i) {
+  two_layer_signal(rebal_dates[i], i, N_LONG, N_SHORT, VIX_THRESHOLD,
+                    cluster_input, cluster_mat)
 })
 ```
 
-## Cluster Assignment Over Time
+## Regime Timeline
 
-Which regime each month-end was assigned to. Colour = cluster label within that refit (labels shift arbitrarily across refits — interpret by centroid, not by number).
+Which macro regime each month-end was assigned to (Layer 1). Colour = regime cluster label.
 
-```{r cluster-timeline}
-cluster_timeline <- signals_raw %>%
-  distinct(rebal_date, cluster, n_obs) %>%
-  mutate(cluster = factor(cluster))
+```{r regime-timeline}
+regime_timeline <- signals_raw %>%
+  distinct(rebal_date, regime) %>%
+  mutate(regime = factor(regime))
 
-p_timeline <- ggplot(cluster_timeline,
-                     aes(x = rebal_date, y = cluster, colour = cluster)) +
-  geom_point(aes(size = n_obs), alpha = 0.7) +
-  geom_line(aes(group = 1), alpha = 0.2, colour = "grey50") +
-  scale_colour_manual(values = c("#4e79a7","#e15759","#59a14f","#f28e2b",
-                                  "#b07aa1","#76b7b2")[seq_len(K_CLUSTERS)]) +
-  scale_size_continuous(range = c(1, 5), name = "Cluster size") +
-  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
-  labs(
-    title    = "Cluster Assignment at Each Month-End Rebalancing Date",
-    subtitle = "Point size = number of historical dates in that cluster  |  Labels shift across refits — read centroid heatmap",
-    x = NULL, y = "Cluster", colour = "Cluster"
+ggplot(regime_timeline, aes(x = rebal_date, y = 1, fill = regime)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c("1" = "#4e79a7", "2" = "#f28e2b", "3" = "#59a14f"),
+    na.value = "grey85", name = "Regime"
   ) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Layer 1: Market Regime Over Time",
+       subtitle = "Macro clustering (VIX, VRP, yield curve, breakeven)",
+       x = NULL, y = NULL) +
   theme_minimal(base_size = 11) +
-  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank(), legend.position = "top")
+```
 
-ggplotly(p_timeline, tooltip = c("x", "y", "size"))
+## Sector Cluster Assignment (Layer 2)
+
+Which cluster each sector was placed in within the current regime. Best cluster (highest regime return) shown highlighted.
+
+```{r sector-cluster-heatmap}
+sector_heatmap <- signals_raw %>%
+  mutate(ticker         = factor(ticker, levels = rev(sector_tickers)),
+         sector_cluster = factor(sector_cluster))
+
+ggplot(sector_heatmap, aes(x = rebal_date, y = ticker, fill = sector_cluster)) +
+  geom_tile(colour = "white", linewidth = 0.2) +
+  scale_fill_manual(
+    values = c("1" = "#4e79a7", "2" = "#f28e2b", "3" = "#59a14f"),
+    na.value = "grey85", name = "Sector Cluster"
+  ) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title    = "Layer 2: Sector Cluster Assignment Within Regime",
+       subtitle = "Sectors grouped by regime-conditional return/vol/Sharpe",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 8),
+        panel.grid  = element_blank(), legend.position = "top")
 ```
 
 ## Sector Signal Heatmap
@@ -920,9 +987,9 @@ signals_raw %>%
                              TRUE ~ "flat"),
     avg_ret_pct  = scales::percent(avg_ret, accuracy = 0.01)
   ) %>%
-  select(rebal_date, ticker, avg_ret_pct, signal_label, n_obs) %>%
+  select(rebal_date, ticker, avg_ret_pct, signal_label, sector_cluster, regime) %>%
   knitr::kable(
-    col.names = c("Rebal Date", "Sector", "Avg Cluster Return", "Signal", "Cluster Obs"),
+    col.names = c("Rebal Date", "Sector", "Regime Return", "Signal", "Sector Cluster", "Regime"),
     caption   = "Most recent month-end signal — execute at next month open"
   )
 ```
@@ -1064,6 +1131,73 @@ plot_ly(
   )
 ```
 
+## Animated Cluster Assignment — Training Period
+
+Each bubble is a sector coloured by its K-means cluster assignment at that rebalancing date. Use the slider to step through the training period and see exactly which cluster each sector was placed in each month. Cluster numbers are not economically labelled — use the feature profile heatmap to interpret what each cluster represents.
+
+```{r cluster-animated}
+cluster_palette <- c("1" = "#4e79a7", "2" = "#f28e2b", "3" = "#59a14f")
+
+cluster_snapshots <- signals_raw %>%
+  distinct(rebal_date, ticker, sector_cluster) %>%
+  left_join(snap_features, by = c("rebal_date" = "date", "ticker")) %>%
+  mutate(
+    frame_label = format(rebal_date, "%Y-%m"),
+    color_hex   = cluster_palette[as.character(sector_cluster)]
+  ) %>%
+  drop_na(rel_momentum, spread_z, beta_252) %>%
+  mutate(bubble_size = scales::rescale(beta_252,
+                                       to   = c(10, 30),
+                                       from = c(0, max(abs(beta_252), na.rm = TRUE))))
+
+# Main animated scatter — colors encoded as a column, not a grouping aesthetic
+p_cluster <- plot_ly(
+  cluster_snapshots,
+  x            = ~rel_momentum,
+  y            = ~spread_z,
+  size         = ~bubble_size,
+  text         = ~ticker,
+  frame        = ~frame_label,
+  type         = "scatter",
+  mode         = "markers+text",
+  textposition = "top center",
+  showlegend   = FALSE,
+  marker       = list(
+    color    = ~color_hex,
+    sizemode = "diameter",
+    sizeref  = 1,
+    opacity  = 0.85,
+    line     = list(width = 0)
+  )
+)
+
+# Add dummy traces for legend (one per cluster, no frame so they stay fixed)
+for (k in c(1, 2, 3)) {
+  p_cluster <- p_cluster %>%
+    add_markers(
+      x = NA_real_, y = NA_real_,
+      name   = paste0("Cluster ", k),
+      marker = list(color = cluster_palette[[as.character(k)]], size = 12),
+      showlegend = TRUE,
+      inherit    = FALSE
+    )
+}
+
+p_cluster %>%
+  animation_opts(frame = 600, transition = 300, redraw = FALSE) %>%
+  animation_slider(currentvalue = list(prefix = "Month-end: ", font = list(size = 12))) %>%
+  animation_button(x = 0, xanchor = "left", y = -0.12) %>%
+  layout(
+    title  = list(text = "Sector Cluster Assignments at Each Rebalancing Date (Training)",
+                  font = list(size = 14)),
+    xaxis  = list(title = "Relative Momentum (sector − SPY, 21d log return)",
+                  range = x_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    yaxis  = list(title = "Vol Stress Z-Score (sector rvol − VIX, 252d normalised)",
+                  range = y_range, zeroline = TRUE, zerolinecolor = "#aaa"),
+    legend = list(title = list(text = "Cluster"))
+  )
+```
+
 ## Animated Snapshot — Vol Stress vs Absolute Momentum
 
 Same animation using `spread_z` (y) and raw `log_ret_21` (x) — absolute sector return rather than excess over SPY. During bull markets all sectors shift right together; during bear markets all shift left. This shows whether a sector's momentum is positive in absolute terms, while spread_z shows whether its vol is elevated relative to its own history.
@@ -1132,7 +1266,7 @@ plot_ly(
 
 Daily P&L chain for the training window. Signals are generated at each month-end close and executed at the open of the following trading day. Positions are held until the next rebalancing. Portfolio weight = 1/N_LONG per long sector; N_SHORT = 0 (long-only). Total allocation is always 100% when at least one long is active.
 
-Transaction costs of **5 bps per side** (buy or sell) are applied only to positions that actually change at each rebalancing — sectors that are held across months pay no cost. Close-to-close daily returns are used throughout.
+Transaction costs of **5 bps per side** (buy or sell) are applied only to positions that actually change at each rebalancing — sectors held across months pay no cost. During DD stop months, cash earns the daily risk-free rate (`rf_daily` = ^IRX/252), the same 3-month T-bill rate that underlies short-duration T-bill ETFs. Close-to-close daily returns are used throughout.
 
 ```{r training-pnl}
 # -- Step 1: Map each rebal_date to its execution date (next available trading day) --
@@ -1279,7 +1413,7 @@ daily_pnl_dd <- compute_weights(daily_pos_dd) %>%
     portfolio_ret = portfolio_ret_gross - tc,
     cumeq_dd      = cumprod(1 + portfolio_ret)
   ) %>%
-  select(date, cumeq_dd)
+  select(date, cumeq_dd, portfolio_ret_dd = portfolio_ret)
 
 # -- Step 5: SPY buy-and-hold benchmark --
 spy_bh <- raw_data %>%
@@ -1524,17 +1658,37 @@ excess_strat_gross <- strat_rets_gross - rf_joined$rf_daily
 sharpe_strat_gross <- (mean(excess_strat_gross, na.rm = TRUE) /
                        sd(excess_strat_gross,   na.rm = TRUE)) * sqrt(252)
 
+# DD-stop returns (daily)
+dd_stop_rets <- replace_na(training_perf$portfolio_ret_dd, 0)
+excess_dd    <- dd_stop_rets - rf_joined$rf_daily
+sharpe_dd    <- (mean(excess_dd, na.rm = TRUE) / sd(excess_dd, na.rm = TRUE)) * sqrt(252)
+
+# Omega ratio — threshold L = 0 (full distribution, no normality assumption)
+# Omega > 1 means probability-weighted gains exceed losses
+# Preferred over Sharpe when returns are fat-tailed (2000-02, 2008-09, 2020 shocks)
+omega_fn <- function(rets, L = 0) {
+  excess <- rets - L
+  sum(pmax(excess, 0)) / sum(pmax(-excess, 0))
+}
+
+omega_strat       <- omega_fn(strat_rets)
+omega_strat_gross <- omega_fn(strat_rets_gross)
+omega_spy         <- omega_fn(spy_rets)
+omega_dd          <- omega_fn(dd_stop_rets)
+
 tibble(
-  Metric = c("Total Return", "CAGR", "Ann. Volatility", "Sharpe Ratio",
-             "Max Drawdown", "MDD Date", "TC Drag", "Period"),
-  `Strategy + DD Stop` = c(
+  Metric = c("Total Return", "CAGR", "Ann. Volatility", "Sharpe Ratio", "Omega (L=0)",
+             "Max Drawdown", "MDD Date", "TC Drag", "Cash vehicle (flat periods)", "Period"),
+  `Strategy + DD Stop (rf_daily)` = c(
     scales::percent(last(training_perf$cumeq_dd, na.rm = TRUE) - 1, accuracy = 0.1),
     scales::percent((last(training_perf$cumeq_dd, na.rm = TRUE))^(1/n_years) - 1, accuracy = 0.1),
     "—",
-    "—",
+    round(sharpe_dd, 3),
+    round(omega_dd, 3),
     scales::percent(max_dd_dd_stop, accuracy = 0.1),
     format(mdd_date_dd_stop, "%Y-%m-%d"),
     "—",
+    "^IRX / 252 (rf_daily)",
     paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
   ),
   `Strategy (net TC)` = c(
@@ -1542,9 +1696,11 @@ tibble(
     scales::percent(cagr_strat,        accuracy = 0.1),
     scales::percent(ann_vol_strat,     accuracy = 0.1),
     round(sharpe_strat, 3),
+    round(omega_strat, 3),
     scales::percent(max_dd_strat,      accuracy = 0.1),
     format(mdd_date_strat, "%Y-%m-%d"),
     scales::percent(total_strat_gross - total_strat, accuracy = 0.1),
+    "Cash (0%)",
     paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
   ),
   `Strategy (gross)` = c(
@@ -1552,7 +1708,9 @@ tibble(
     scales::percent(cagr_strat_gross,       accuracy = 0.1),
     scales::percent(ann_vol_strat_gross,    accuracy = 0.1),
     round(sharpe_strat_gross, 3),
+    round(omega_strat_gross, 3),
     scales::percent(max_dd_strat_gross,     accuracy = 0.1),
+    "—",
     "—",
     "—",
     paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
@@ -1562,11 +1720,797 @@ tibble(
     scales::percent(cagr_spy,     accuracy = 0.1),
     scales::percent(ann_vol_spy,  accuracy = 0.1),
     round(sharpe_spy, 3),
+    round(omega_spy, 3),
     scales::percent(max_dd_spy,   accuracy = 0.1),
     format(mdd_date_spy, "%Y-%m-%d"),
+    "—",
     "—",
     paste(format(TRAIN_START, "%Y-%m-%d"), "–", format(TRAIN_END, "%Y-%m-%d"))
   )
 ) %>%
-  knitr::kable(caption = "Training Period Performance Summary (5 bps/side TC)", align = "lrrrr")
+  knitr::kable(caption = "Training Period Performance Summary — 5 bps/side TC | Flat periods earn rf_daily (^IRX)", align = "lrrrr")
+```
+
+---
+
+# Optimization
+
+Grid search over four parameters on the training window. K-means is pre-computed once per K value (expanding window, all rebalancing dates) so signal generation for each parameter combination only reuses stored assignments rather than re-running k-means — this keeps the 108-combo grid tractable. Objective: maximise **Omega (L = 0)**, which captures tail asymmetry better than Sharpe for fat-tailed return distributions.
+
+Parameter grid: K ∈ {2,3,4,5} × N_LONG ∈ {2,3,4} × VIX_THRESHOLD ∈ {20,25,30} × DD_STOP ∈ {−0.15,−0.20,−0.25} = **108 combinations**.
+
+## Pre-compute Expanding Window K-Means
+
+```{r opt-precompute}
+#| cache: true
+
+# Pre-compute Layer 1 (regime detection) — same for all parameter combos
+# Layer 2 (sector clustering) is cheap and runs inline per combo
+km_precomputed <- lapply(seq_along(rebal_dates), function(i) {
+  t   <- rebal_dates[i]
+  idx <- which(cluster_input$date == t)
+  if (length(idx) == 0 || idx < K_CLUSTERS * 3) return(NULL)
+
+  window_mat <- cluster_mat[1:idx, , drop = FALSE]
+  set.seed(42 + i)
+  km <- kmeans(window_mat, centers = K_CLUSTERS, nstart = 25, iter.max = 200)
+
+  current_regime <- km$cluster[idx]
+  vix_val <- features_wide %>% filter(date == t) %>% pull(vix)
+
+  list(
+    t             = t,
+    regime        = current_regime,
+    regime_dates  = cluster_input$date[1:idx][km$cluster == current_regime],
+    current_vix   = if (length(vix_val) == 1) vix_val else NA_real_
+  )
+})
+
+cat(sprintf("Pre-computed Layer 1 for K=%d across %d rebalancing dates\n",
+            K_CLUSTERS, length(rebal_dates)))
+```
+
+## Strategy Functions
+
+```{r opt-functions}
+# Helper: portfolio weights from a position tibble (same logic as training P&L)
+opt_weights <- function(pos_tbl) {
+  pos_tbl %>%
+    group_by(date) %>%
+    mutate(
+      n_long  = sum(signal == 1L,  na.rm = TRUE),
+      n_short = sum(signal == -1L, na.rm = TRUE),
+      weight  = case_when(
+        signal ==  1L & n_long  > 0 ~  1 / n_long,
+        signal == -1L & n_short > 0 ~ -1 / n_short,
+        TRUE                        ~  0
+      )
+    ) %>%
+    ungroup()
+}
+
+# Generate 2-layer signals from pre-computed Layer 1 results
+opt_signals <- function(km_results, N_LONG, N_SHORT = 0L,
+                         VIX_THRESHOLD, sector_ret, sector_tickers,
+                         K_SECTORS, min_regime_obs = 20L) {
+  map_dfr(seq_along(km_results), function(i) {
+    res <- km_results[[i]]
+    if (is.null(res)) return(NULL)
+    t <- res$t
+
+    flat <- tibble(rebal_date = t, regime = res$regime, sector_cluster = NA_integer_,
+                   n_regime_dates = length(res$regime_dates),
+                   ticker = sector_tickers, avg_ret = NA_real_, signal = 0L)
+
+    if (!is.na(res$current_vix) && res$current_vix > VIX_THRESHOLD) return(flat)
+    if (length(res$regime_dates) < min_regime_obs)                   return(flat)
+
+    # Cap to most recent regime dates
+    regime_dates_recent <- tail(res$regime_dates, MAX_REGIME_DAYS)
+
+    # Layer 2: sector clustering within regime
+    regime_stats <- sector_ret %>%
+      filter(date %in% regime_dates_recent, ticker %in% sector_tickers) %>%
+      group_by(ticker) %>%
+      summarise(regime_ret = mean(retClCl, na.rm = TRUE),
+                regime_vol = sd(retClCl, na.rm = TRUE),
+                regime_sharpe = if_else(regime_vol > 0, regime_ret / regime_vol, 0),
+                .groups = "drop") %>%
+      drop_na()
+
+    if (nrow(regime_stats) < K_SECTORS + 1) return(flat)
+
+    feat <- regime_stats %>% select(regime_ret, regime_vol, regime_sharpe) %>% scale()
+    set.seed(100 + i)
+    km_s <- kmeans(feat, centers = K_SECTORS, nstart = 25, iter.max = 200)
+    regime_stats$sector_cluster <- km_s$cluster
+
+    best_cl <- regime_stats %>%
+      group_by(sector_cluster) %>%
+      summarise(avg = mean(regime_ret), .groups = "drop") %>%
+      slice_max(avg, n = 1, with_ties = FALSE) %>% pull(sector_cluster)
+
+    mom_now <- sector_ret %>% filter(date == t) %>% select(ticker, momentum_60)
+
+    best <- regime_stats %>%
+      filter(sector_cluster == best_cl) %>%
+      left_join(mom_now, by = "ticker") %>%
+      arrange(desc(momentum_60)) %>%
+      mutate(rank = row_number(), signal = if_else(rank <= N_LONG, 1L, 0L))
+
+    regime_stats %>%
+      select(ticker, sector_cluster, avg_ret = regime_ret) %>%
+      left_join(best %>% select(ticker, signal), by = "ticker") %>%
+      mutate(signal = replace_na(signal, 0L)) %>%
+      {bind_rows(., tibble(ticker = setdiff(sector_tickers, .$ticker),
+                            sector_cluster = NA_integer_, avg_ret = NA_real_, signal = 0L))} %>%
+      mutate(rebal_date = t, regime = res$regime,
+             n_regime_dates = length(res$regime_dates))
+  })
+}
+
+# Full P&L chain → scalar metrics (Omega, Sharpe, CAGR, max DD)
+opt_metrics <- function(signals_raw, DD_STOP,
+                         spy_dates, exec_map, sector_tickers,
+                         daily_rets, rf_daily, TC_BPS = 0.0005) {
+
+  if (is.null(signals_raw) || nrow(signals_raw) == 0)
+    return(tibble(cagr=NA, sharpe=NA, omega=NA, max_dd=NA, total_ret=NA))
+
+  # -- Daily positions --
+  daily_signals <- signals_raw %>%
+    select(rebal_date, ticker, signal) %>%
+    inner_join(exec_map, by = "rebal_date") %>%
+    select(date = exec_date, ticker, signal)
+
+  daily_pos <- expand_grid(date = spy_dates, ticker = sector_tickers) %>%
+    left_join(daily_signals, by = c("date", "ticker")) %>%
+    arrange(ticker, date) %>%
+    group_by(ticker) %>%
+    fill(signal, .direction = "down") %>%
+    mutate(signal = replace_na(signal, 0L)) %>%
+    ungroup()
+
+  # -- First-pass P&L (no DD stop) --
+  w1 <- opt_weights(daily_pos)
+
+  tc1 <- w1 %>%
+    arrange(ticker, date) %>%
+    group_by(ticker) %>%
+    mutate(prev_w = dplyr::lag(weight, default = 0)) %>%
+    ungroup() %>%
+    group_by(date) %>%
+    summarise(tc = sum(abs(weight - prev_w), na.rm = TRUE) * TC_BPS, .groups = "drop")
+
+  pnl1 <- w1 %>%
+    left_join(daily_rets, by = c("date", "ticker")) %>%
+    group_by(date) %>%
+    summarise(ret_gross = sum(weight * replace_na(ret_cc, 0), na.rm = TRUE),
+              n_long = first(n_long), .groups = "drop") %>%
+    left_join(tc1, by = "date") %>%
+    mutate(tc = replace_na(tc, 0),
+           ret  = ret_gross - tc,
+           cumeq = cumprod(1 + ret))
+
+  # -- DD stop overlay --
+  month_end_dd <- pnl1 %>%
+    mutate(ym = floor_date(date, "month")) %>%
+    group_by(ym) %>% slice_max(date, n = 1) %>% ungroup() %>%
+    arrange(date) %>%
+    mutate(peak = cummax(cumeq), dd = (cumeq - peak) / peak,
+           in_stop = dd < DD_STOP,
+           next_ym_stop = dplyr::lead(in_stop, default = FALSE)) %>%
+    mutate(ym = floor_date(date %m+% months(1), "month")) %>%
+    select(ym, next_ym_stop)
+
+  daily_pos_dd <- daily_pos %>%
+    mutate(ym = floor_date(date, "month")) %>%
+    left_join(month_end_dd, by = "ym") %>%
+    mutate(next_ym_stop = replace_na(next_ym_stop, FALSE),
+           signal = if_else(next_ym_stop, 0L, signal)) %>%
+    select(-ym, -next_ym_stop)
+
+  # -- Second-pass P&L (DD stop + rf_daily during flat) --
+  w2 <- opt_weights(daily_pos_dd)
+
+  tc2 <- w2 %>%
+    arrange(ticker, date) %>%
+    group_by(ticker) %>%
+    mutate(prev_w = dplyr::lag(weight, default = 0)) %>%
+    ungroup() %>%
+    group_by(date) %>%
+    summarise(tc = sum(abs(weight - prev_w), na.rm = TRUE) * TC_BPS, .groups = "drop")
+
+  pnl2 <- w2 %>%
+    left_join(daily_rets, by = c("date", "ticker")) %>%
+    group_by(date) %>%
+    summarise(ret_gross = sum(weight * replace_na(ret_cc, 0), na.rm = TRUE),
+              n_long = first(n_long), .groups = "drop") %>%
+    left_join(tc2,     by = "date") %>%
+    left_join(rf_daily, by = "date") %>%
+    arrange(date) %>%
+    mutate(
+      tc       = replace_na(tc, 0),
+      rf_daily = replace_na(rf_daily, 0),
+      in_stop  = n_long == 0,
+      sgov_tc  = if_else(
+        (in_stop & !dplyr::lag(in_stop, default = FALSE)) |
+        (!in_stop &  dplyr::lag(in_stop, default = FALSE)),
+        TC_BPS, 0),
+      ret_gross = if_else(in_stop, rf_daily, ret_gross),
+      ret       = ret_gross - tc - sgov_tc,
+      cumeq     = cumprod(1 + ret)
+    )
+
+  # -- Scalar metrics --
+  n_years  <- nrow(pnl2) / 252
+  rets     <- pnl2$ret
+  rf       <- pnl2$rf_daily
+  excess   <- rets - rf
+  peak     <- cummax(pnl2$cumeq)
+  max_dd   <- min((pnl2$cumeq - peak) / peak, na.rm = TRUE)
+  total    <- last(pnl2$cumeq) - 1
+
+  tibble(
+    total_ret = total,
+    cagr      = (1 + total)^(1 / n_years) - 1,
+    sharpe    = (mean(excess, na.rm = TRUE) / sd(excess, na.rm = TRUE)) * sqrt(252),
+    omega     = sum(pmax(rets, 0)) / sum(pmax(-rets, 0)),
+    max_dd    = max_dd
+  )
+}
+```
+
+## Grid Search
+
+```{r opt-run}
+
+# K fixed at 3 — removed from grid (27 combos instead of 108)
+param_grid <- expand_grid(
+  N_LONG        = 2:4,
+  VIX_THRESHOLD = c(20, 25, 30),
+  DD_STOP       = c(-0.15, -0.20, -0.25)
+)
+
+cat(sprintf("Running %d parameter combinations (K fixed at %d) on %d cores...\n",
+            nrow(param_grid), K_CLUSTERS, max(1, detectCores() - 1)))
+
+n_cores <- max(1, detectCores() - 1)
+cl      <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+clusterExport(cl, varlist = c(
+  "km_precomputed", "K_CLUSTERS", "K_SECTORS", "MAX_REGIME_DAYS",
+  "sector_ret", "sector_tickers",
+  "daily_rets", "spy_dates", "exec_map", "rf_daily",
+  "opt_weights", "opt_signals", "opt_metrics"
+))
+clusterEvalQ(cl, {
+  library(tidyverse)
+  library(lubridate)
+})
+
+opt_results <- foreach(
+  i         = seq_len(nrow(param_grid)),
+  .combine  = bind_rows,
+  .packages = c("tidyverse", "lubridate")
+) %dopar% {
+  p <- param_grid[i, ]
+
+  sigs <- opt_signals(
+    km_results     = km_precomputed,
+    N_LONG         = p$N_LONG,
+    VIX_THRESHOLD  = p$VIX_THRESHOLD,
+    sector_ret     = sector_ret,
+    sector_tickers = sector_tickers,
+    K_SECTORS      = K_SECTORS
+  )
+
+  metrics <- opt_metrics(
+    signals_raw    = sigs,
+    DD_STOP        = p$DD_STOP,
+    spy_dates      = spy_dates,
+    exec_map       = exec_map,
+    sector_tickers = sector_tickers,
+    daily_rets     = daily_rets,
+    rf_daily       = rf_daily
+  )
+
+  bind_cols(p, metrics)
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+cat("Done.\n")
+```
+
+## Results
+
+```{r opt-results-table}
+opt_results %>%
+  arrange(desc(omega)) %>%
+  mutate(
+    across(c(total_ret, cagr, max_dd), scales::percent, accuracy = 0.1),
+    across(c(sharpe, omega),           round, digits = 3),
+    DD_STOP = scales::percent(DD_STOP, accuracy = 1)
+  ) %>%
+  head(20) %>%
+  knitr::kable(
+    col.names = c("N Long", "VIX Thresh", "DD Stop",
+                  "Total Ret", "CAGR", "Sharpe", "Omega", "Max DD"),
+    caption   = paste0("Top 20 parameter combinations by Omega (L = 0) — training period (K = ",
+                       K_CLUSTERS, " fixed)"),
+    align     = "rrrrrrrr"
+  )
+```
+
+```{r opt-heatmap}
+# Omega heatmap: N_LONG × DD_STOP, faceted by VIX_THRESHOLD (K fixed at 3)
+heatmap_data <- opt_results %>%
+  mutate(N_LONG        = factor(N_LONG),
+         DD_STOP_label = scales::percent(DD_STOP, accuracy = 1),
+         VIX_label     = paste0("VIX ≤ ", VIX_THRESHOLD))
+
+p_heat <- ggplot(heatmap_data,
+                 aes(x = N_LONG, y = DD_STOP_label, fill = omega)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(omega, 2)), size = 3) +
+  scale_fill_gradient2(low = "#e15759", mid = "white", high = "#59a14f",
+                       midpoint = 1, name = "Omega") +
+  facet_wrap(~VIX_label) +
+  labs(
+    title    = paste0("Omega by N_LONG and DD Stop — K = ", K_CLUSTERS, " (fixed)"),
+    subtitle = "Green = Omega > 1 (gains dominate losses)  |  Red = Omega < 1",
+    x = "N Long", y = "DD Stop"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_heat
+```
+
+## Best Parameters
+
+```{r opt-best}
+# Select best combination by Omega (K already fixed at 3)
+best <- opt_results %>% slice_max(omega, n = 1, with_ties = FALSE)
+
+cat(sprintf(
+  "Best combination (Omega = %.3f):\n  K = %d (fixed) | N_LONG = %d | VIX_THRESHOLD = %d | DD_STOP = %.0f%%\n  CAGR = %.1f%% | Sharpe = %.3f | Max DD = %.1f%%\n",
+  best$omega, K_CLUSTERS, best$N_LONG, best$VIX_THRESHOLD,
+  best$DD_STOP * 100,
+  best$cagr * 100, best$sharpe, best$max_dd * 100
+))
+
+# Lock in selected parameters — used by test period section
+N_LONG        <- best$N_LONG
+VIX_THRESHOLD <- best$VIX_THRESHOLD
+DD_STOP       <- best$DD_STOP
+DD_PARTIAL    <- DD_STOP / 2   # partial re-entry zone: halfway to full stop
+```
+
+---
+
+# Test Period
+
+Out-of-sample evaluation using parameters locked from training. The expanding window continues from where training ended — each test-month rebalancing refits K-means on all data (training + test so far), so the regime model adapts as new information arrives without ever looking ahead.
+
+Normalisation uses the **training-period recipe** (`cluster_prep`) applied to test features — training mean/sd are used for scaling, preventing data leakage.
+
+## Feature Extension & Signal Generation
+
+```{r test-setup}
+# Extend Layer 1 cluster input to test period
+# Use training recipe (cluster_prep) to normalise — no leakage
+test_cluster_input <- features_kf %>%
+  filter(date >= TEST_START, date <= TEST_END) %>%
+  select(date, all_of(cluster_cols)) %>%
+  drop_na()
+
+test_cluster_mat <- bake(cluster_prep,
+                         new_data = test_cluster_input %>% select(-date)) %>%
+  as.matrix()
+
+# Full expanding window: training + test rows
+full_cluster_input <- bind_rows(cluster_input, test_cluster_input)
+full_cluster_mat   <- rbind(cluster_mat, test_cluster_mat)
+
+# Test rebalancing dates: month-end trading days in test window
+test_rebal_dates <- test_cluster_input %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  arrange(date) %>%
+  pull(date)
+
+# Trading days in test window
+test_dates <- raw_data %>%
+  filter(ticker == "SPY", date >= TEST_START, date <= TEST_END) %>%
+  arrange(date) %>%
+  pull(date)
+
+cat(sprintf("%d test rebalancing dates | %d trading days\n",
+            length(test_rebal_dates), length(test_dates)))
+```
+
+```{r test-signals}
+# Two-layer signals for test period
+# Layer 1 expanding window continues from training; Layer 2 runs inline
+test_signals <- map_dfr(seq_along(test_rebal_dates), function(i) {
+  two_layer_signal(test_rebal_dates[i], i, N_LONG, N_SHORT, VIX_THRESHOLD,
+                    full_cluster_input, full_cluster_mat,
+                    seed_offset = 1000L)
+})
+
+glimpse(test_signals)
+```
+
+## P&L
+
+```{r test-pnl}
+# Execution map: first trading day after each test rebal_date
+test_exec_map <- tibble(rebal_date = test_rebal_dates) %>%
+  rowwise() %>%
+  mutate(exec_date = {
+    cands <- test_dates[test_dates > rebal_date]
+    if (length(cands) == 0) NA_Date_ else cands[1]
+  }) %>%
+  ungroup() %>%
+  filter(!is.na(exec_date))
+
+# Daily positions (forward-fill signals from exec_date)
+test_daily_signals <- test_signals %>%
+  select(rebal_date, ticker, signal) %>%
+  inner_join(test_exec_map, by = "rebal_date") %>%
+  select(date = exec_date, ticker, signal)
+
+test_daily_pos <- expand_grid(date = test_dates, ticker = sector_tickers) %>%
+  left_join(test_daily_signals, by = c("date", "ticker")) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  fill(signal, .direction = "down") %>%
+  mutate(signal = replace_na(signal, 0L)) %>%
+  ungroup()
+
+# Close-to-close returns for test period
+test_daily_rets <- raw_data %>%
+  filter(ticker %in% sector_tickers, date %in% test_dates) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(ret_cc = Close / dplyr::lag(Close) - 1) %>%
+  ungroup() %>%
+  select(date, ticker, ret_cc)
+
+# TC on weight turnover
+test_rebal_costs <- compute_weights(test_daily_pos) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(prev_weight = dplyr::lag(weight, default = 0)) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarise(tc = sum(abs(weight - prev_weight), na.rm = TRUE) * TC_BPS, .groups = "drop")
+
+# First-pass P&L
+test_pnl1 <- compute_weights(test_daily_pos) %>%
+  left_join(test_daily_rets, by = c("date", "ticker")) %>%
+  group_by(date) %>%
+  summarise(ret_gross = sum(weight * replace_na(ret_cc, 0), na.rm = TRUE),
+            n_long = first(n_long), .groups = "drop") %>%
+  left_join(test_rebal_costs, by = "date") %>%
+  mutate(tc = replace_na(tc, 0),
+         ret   = ret_gross - tc,
+         cumeq = cumprod(1 + ret))
+
+# -- Second pass: scaled exposure (B + C) --
+# Scale factor per month:
+#   dd >= DD_PARTIAL              → 1.0  (full exposure)
+#   DD_STOP <= dd < DD_PARTIAL    → 0.5  (partial re-entry zone)
+#   dd < DD_STOP & VIX > VIX_REENTRY → 0.0  (fully flat)
+#   dd < DD_STOP & VIX <= VIX_REENTRY → 0.5  (VIX recovery override)
+# Uninvested fraction (1 - scale) earns rf_daily each day.
+
+vix_daily <- features_wide %>% select(date, vix)
+
+test_month_end_scale <- test_pnl1 %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>% slice_max(date, n = 1) %>% ungroup() %>%
+  arrange(date) %>%
+  left_join(vix_daily, by = "date") %>%
+  mutate(
+    peak  = cummax(cumeq),
+    dd    = (cumeq - peak) / peak,
+    # Base scale from drawdown level
+    scale = case_when(
+      dd >= DD_PARTIAL                              ~ 1.0,
+      dd >= DD_STOP & dd < DD_PARTIAL               ~ 0.5,
+      TRUE                                          ~ 0.0
+    ),
+    # VIX recovery override (C): if fully flat but VIX normalises, unlock 50%
+    scale = if_else(scale == 0 & !is.na(vix) & vix <= VIX_REENTRY, 0.5, scale),
+    next_ym_scale = as.numeric(dplyr::lead(scale, default = 1.0))
+  ) %>%
+  mutate(ym = floor_date(date %m+% months(1), "month")) %>%
+  select(ym, next_ym_scale)
+
+# Attach scale to daily positions (signals unchanged — scaling applied to weights)
+test_daily_pos_scaled <- test_daily_pos %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  left_join(test_month_end_scale, by = "ym") %>%
+  mutate(next_ym_scale = replace_na(next_ym_scale, 1.0)) %>%
+  select(-ym)
+
+# TC on scaled weight turnover
+test_rc_scaled <- compute_weights(test_daily_pos_scaled) %>%
+  mutate(weight_s = weight * next_ym_scale) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  mutate(prev_ws = dplyr::lag(weight_s, default = 0)) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarise(tc = sum(abs(weight_s - prev_ws), na.rm = TRUE) * TC_BPS, .groups = "drop")
+
+# Second-pass P&L: sectors earn scaled return; uninvested earns rf_daily
+test_pnl2 <- compute_weights(test_daily_pos_scaled) %>%
+  mutate(weight_s = weight * next_ym_scale) %>%
+  left_join(test_daily_rets, by = c("date", "ticker")) %>%
+  group_by(date) %>%
+  summarise(
+    ret_sectors = sum(weight_s * replace_na(ret_cc, 0), na.rm = TRUE),
+    dd_scale    = first(next_ym_scale),
+    .groups     = "drop"
+  ) %>%
+  left_join(test_rc_scaled, by = "date") %>%
+  left_join(rf_daily,       by = "date") %>%
+  arrange(date) %>%
+  mutate(
+    tc       = replace_na(tc, 0),
+    rf_daily = replace_na(rf_daily, 0),
+    # Uninvested portion earns rf_daily; fully flat = only rf
+    ret_gross = ret_sectors + (1 - dd_scale) * rf_daily,
+    # TC on rf entry/exit only when transitioning to/from fully flat
+    fully_flat = dd_scale == 0,
+    rf_tc = if_else(
+      (fully_flat & !dplyr::lag(fully_flat, default = FALSE)) |
+      (!fully_flat &  dplyr::lag(fully_flat, default = FALSE)),
+      TC_BPS, 0),
+    ret   = ret_gross - tc - rf_tc,
+    cumeq = cumprod(1 + ret)
+  )
+
+# SPY buy-and-hold for test period
+test_spy_bh <- raw_data %>%
+  filter(ticker == "SPY", date %in% test_dates) %>%
+  arrange(date) %>%
+  mutate(ret_cc    = Close / dplyr::lag(Close) - 1,
+         cumeq_spy = cumprod(1 + replace_na(ret_cc, 0))) %>%
+  select(date, cumeq_spy, ret_cc_spy = ret_cc)
+
+test_perf <- test_pnl2 %>%
+  select(date, cumeq, ret, rf_daily, dd_scale) %>%
+  mutate(dd_scale = as.numeric(dd_scale)) %>%
+  left_join(test_spy_bh, by = "date")
+
+cat(sprintf(
+  "Strategy: %.1f%%  |  SPY B&H: %.1f%%\nMonths fully flat: %d  |  Months at 50%%: %d  |  Months full: %d\n",
+  (last(test_perf$cumeq) - 1) * 100,
+  (last(test_perf$cumeq_spy) - 1) * 100,
+  sum(test_perf$dd_scale == 0,   na.rm = TRUE) %/% 21,
+  sum(test_perf$dd_scale == 0.5, na.rm = TRUE) %/% 21,
+  sum(test_perf$dd_scale == 1.0, na.rm = TRUE) %/% 21
+))
+```
+
+## Cumulative Return
+
+```{r test-chart-cumeq}
+# Shade background by exposure scale
+scale_regions <- test_perf %>%
+  mutate(
+    exposure_label = case_when(
+      near(dd_scale, 0)   ~ "Flat (rf only)",
+      near(dd_scale, 0.5) ~ "50% exposure",
+      TRUE                ~ "Full exposure"
+    )
+  )
+
+plot_ly(test_perf, x = ~date) %>%
+  add_lines(y = ~cumeq,     name = "Strategy (net TC + scaled DD)",
+            line = list(color = "#4e79a7", width = 2)) %>%
+  add_lines(y = ~cumeq_spy, name = "SPY Buy & Hold",
+            line = list(color = "#e15759", width = 2, dash = "dash")) %>%
+  add_lines(data = filter(scale_regions, near(dd_scale, 0)),
+            x = ~date, y = ~cumeq,
+            name = "Fully flat periods", mode = "markers",
+            marker = list(color = "orange", size = 4, opacity = 0.6)) %>%
+  add_lines(data = filter(scale_regions, near(dd_scale, 0.5)),
+            x = ~date, y = ~cumeq,
+            name = "50% exposure periods", mode = "markers",
+            marker = list(color = "#f28e2b", size = 4, opacity = 0.6)) %>%
+  layout(
+    title     = list(text = "Test Period Cumulative Return (Out-of-Sample) — Partial Re-entry + VIX Gate",
+                     font = list(size = 14)),
+    xaxis     = list(title = NULL, type = "date"),
+    yaxis     = list(title = "Cumulative Return (1.0 = start)", tickformat = ".2f"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.99, bgcolor = "rgba(255,255,255,0.8)")
+  )
+```
+
+## Drawdown
+
+```{r test-chart-dd}
+test_dd <- test_perf %>%
+  arrange(date) %>%
+  mutate(peak_strat = cummax(cumeq),
+         peak_spy   = cummax(cumeq_spy),
+         dd_strat   = (cumeq     - peak_strat) / peak_strat,
+         dd_spy     = (cumeq_spy - peak_spy)   / peak_spy)
+
+mdd_strat <- test_dd %>% slice_min(dd_strat, n = 1)
+mdd_spy   <- test_dd %>% slice_min(dd_spy,   n = 1)
+
+plot_ly(test_dd, x = ~date) %>%
+  add_lines(y = ~dd_strat, name = "Strategy",
+            line = list(color = "#4e79a7", width = 2)) %>%
+  add_lines(y = ~dd_spy,   name = "SPY Buy & Hold",
+            line = list(color = "#e15759", width = 2, dash = "dash")) %>%
+  add_markers(data = mdd_strat, x = ~date, y = ~dd_strat,
+              name = paste0("Strategy MDD: ", scales::percent(mdd_strat$dd_strat, accuracy = 0.1)),
+              marker = list(color = "#4e79a7", size = 10, symbol = "circle-open",
+                            line = list(width = 2))) %>%
+  add_markers(data = mdd_spy, x = ~date, y = ~dd_spy,
+              name = paste0("SPY MDD: ", scales::percent(mdd_spy$dd_spy, accuracy = 0.1)),
+              marker = list(color = "#e15759", size = 10, symbol = "circle-open",
+                            line = list(width = 2))) %>%
+  add_segments(x = ~min(date), xend = ~max(date),
+               y = DD_STOP, yend = DD_STOP, inherit = FALSE,
+               line = list(color = "orange", width = 1, dash = "dot"),
+               name = paste0("DD stop (", scales::percent(DD_STOP), ")")) %>%
+  layout(
+    title     = list(text = "Test Period Drawdown from Peak", font = list(size = 14)),
+    xaxis     = list(title = NULL, type = "date"),
+    yaxis     = list(title = "Drawdown", tickformat = ".0%"),
+    hovermode = "x unified",
+    legend    = list(x = 0.01, y = 0.01, bgcolor = "rgba(255,255,255,0.8)")
+  )
+```
+
+## Summary Statistics
+
+```{r test-stats}
+n_test_days  <- nrow(test_perf)
+n_test_years <- n_test_days / 252
+
+test_rets  <- replace_na(test_perf$ret, 0)
+test_rf    <- replace_na(test_perf$rf_daily, 0)
+test_spy   <- replace_na(test_perf$ret_cc_spy, 0)
+excess_t   <- test_rets - test_rf
+excess_spy <- test_spy  - test_rf
+
+test_peak     <- cummax(test_perf$cumeq)
+test_peak_spy <- cummax(test_perf$cumeq_spy)
+test_mdd      <- min((test_perf$cumeq     - test_peak)     / test_peak,     na.rm = TRUE)
+test_mdd_spy  <- min((test_perf$cumeq_spy - test_peak_spy) / test_peak_spy, na.rm = TRUE)
+test_total    <- last(test_perf$cumeq)     - 1
+test_total_spy<- last(test_perf$cumeq_spy) - 1
+
+tibble(
+  Metric    = c("Total Return", "CAGR", "Ann. Volatility", "Sharpe", "Omega (L=0)",
+                "Max Drawdown", "MDD Date", "Period"),
+  Strategy  = c(
+    scales::percent(test_total, accuracy = 0.1),
+    scales::percent((1 + test_total)^(1/n_test_years) - 1, accuracy = 0.1),
+    scales::percent(sd(test_rets, na.rm = TRUE) * sqrt(252), accuracy = 0.1),
+    round((mean(excess_t,   na.rm=TRUE)/sd(excess_t,   na.rm=TRUE))*sqrt(252), 3),
+    round(sum(pmax(test_rets,0))/sum(pmax(-test_rets,0)), 3),
+    scales::percent(test_mdd, accuracy = 0.1),
+    format(test_perf$date[which.min((test_perf$cumeq - test_peak)/test_peak)], "%Y-%m-%d"),
+    paste(format(TEST_START, "%Y-%m-%d"), "–", format(TEST_END, "%Y-%m-%d"))
+  ),
+  `SPY B&H` = c(
+    scales::percent(test_total_spy, accuracy = 0.1),
+    scales::percent((1 + test_total_spy)^(1/n_test_years) - 1, accuracy = 0.1),
+    scales::percent(sd(test_spy, na.rm = TRUE) * sqrt(252), accuracy = 0.1),
+    round((mean(excess_spy, na.rm=TRUE)/sd(excess_spy, na.rm=TRUE))*sqrt(252), 3),
+    round(sum(pmax(test_spy,0))/sum(pmax(-test_spy,0)), 3),
+    scales::percent(test_mdd_spy, accuracy = 0.1),
+    format(test_perf$date[which.min((test_perf$cumeq_spy-test_peak_spy)/test_peak_spy)], "%Y-%m-%d"),
+    paste(format(TEST_START, "%Y-%m-%d"), "–", format(TEST_END, "%Y-%m-%d"))
+  )
+) %>%
+  knitr::kable(caption = "Test Period Performance Summary (Out-of-Sample)",
+               align = "lrr")
+```
+
+## Test Period Signal Heatmap
+
+```{r test-signal-heatmap}
+test_heatmap <- test_signals %>%
+  mutate(ticker = factor(ticker, levels = rev(sector_tickers)),
+         signal = factor(signal, levels = c(-1L, 0L, 1L)))
+
+ggplot(test_heatmap, aes(x = rebal_date, y = ticker, fill = signal)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c("-1" = "#e15759", "0" = "#f5f5f5", "1" = "#59a14f"),
+    labels = c("Short (−1)", "Flat (0)", "Long (+1)")
+  ) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(title    = "Test Period Sector Signals",
+       subtitle = "Generated at month-end close | Executed at next month open",
+       x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold"),
+        axis.text.x     = element_text(angle = 30, hjust = 1, size = 8),
+        panel.grid      = element_blank(),
+        legend.position = "top")
+```
+
+## Regime Assignment — Training Period
+
+```{r train-cluster-heatmap}
+train_regime_ts <- signals_raw %>%
+  distinct(rebal_date, regime) %>%
+  mutate(regime = factor(regime))
+
+ggplot(train_regime_ts, aes(x = rebal_date, y = 1, fill = regime)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_brewer(palette = "Set2", name = "Regime") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title    = "Layer 1: Regime Assignment — Training Period",
+       subtitle = "Macro regime at each month-end rebalancing date",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank(), legend.position = "top")
+```
+
+## Regime Assignment — Test Period
+
+```{r test-cluster-heatmap}
+test_regime_ts <- test_signals %>%
+  distinct(rebal_date, regime) %>%
+  mutate(regime = factor(regime))
+
+ggplot(test_regime_ts, aes(x = rebal_date, y = 1, fill = regime)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_brewer(palette = "Set2", name = "Regime") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(title    = "Layer 1: Regime Assignment — Test Period",
+       subtitle = "Macro regime at each month-end rebalancing date",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank(), legend.position = "top")
+```
+
+## Monthly Signal Diagnostic
+
+```{r test-monthly-diag}
+test_monthly_diag <- test_signals %>%
+  select(rebal_date, ticker, signal, avg_ret, regime, sector_cluster) %>%
+  group_by(rebal_date) %>%
+  summarise(
+    n_long  = sum(signal == 1L),
+    n_flat  = sum(signal == 0L),
+    longs   = paste(ticker[signal == 1L], collapse = ", "),
+    regime  = first(regime),
+    .groups = "drop"
+  ) %>%
+  left_join(features_wide %>% select(date, vix), by = c("rebal_date" = "date")) %>%
+  left_join(
+    test_pnl2 %>%
+      mutate(ym = floor_date(date, "month")) %>%
+      group_by(ym) %>%
+      summarise(month_ret = prod(1 + ret) - 1, .groups = "drop") %>%
+      mutate(rebal_date = ym + months(1) - days(1)),
+    by = "rebal_date"
+  ) %>%
+  select(rebal_date, regime, vix, n_long, longs, month_ret)
+
+print(test_monthly_diag, n = 30)
 ```
